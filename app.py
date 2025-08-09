@@ -202,4 +202,60 @@ with tab_draft:
     ch_keys = list(st.session_state.plan["chapters"].keys()) or ["1"]
     default_key = ch_keys[0]
     ch_num = st.text_input("Chapter number", value=default_key)
-    ch_state = st.session_state.plan["chapters"].setdefault(ch_num, {"title":"", "synopsis":"", "draft":"_
+    ch_state = st.session_state.plan["chapters"].setdefault(ch_num, {"title":"", "synopsis":"", "draft":""})
+    ch_state["title"] = st.text_input("Chapter title", value=ch_state["title"])
+    ch_state["synopsis"] = st.text_area("Chapter synopsis", value=ch_state["synopsis"], height=100)
+    target_words = st.number_input("Target words", 800, 8000, 3500, 100)
+    query_hint = st.text_input("Optional retrieval hint (keywords)")
+
+    if st.button("Retrieve & Draft", type="primary"):
+        q = query_hint or f"{plan['title']} - {ch_state['title']} - {ch_state['synopsis']}"
+        hits = retrieve(q, top_k, tag_filter)
+        blocks = [f"[S{i+1}] {h['text'][:1200]}" for i, h in enumerate(hits)]
+        context = "\n\n".join(blocks) if blocks else "(no retrieved context)"
+        prompt = f"""
+Draft Chapter {ch_num}: "{ch_state['title']}" for the book "{plan['title']}".
+Target length ~{target_words} words.
+Style sheet: {plan['style']}
+Chapter synopsis: {ch_state['synopsis']}
+Book thesis: {plan['thesis']}
+
+Use these retrieved notes (paraphrase; cite as [S1], [S2] if used):
+{context}
+
+Write a cohesive chapter in Markdown with:
+- opening hook
+- 3–6 sections (## / ### headings)
+- smooth transitions
+- ending that tees up the next chapter.
+""".strip()
+        msgs = [{"role":"system","content":"You are a careful long-form writing assistant, reply in Markdown."},
+                {"role":"user","content":prompt}]
+        resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
+        ch_state["draft"] = resp.choices[0].message.content
+        st.success("Draft created.")
+        st.markdown(ch_state["draft"])
+
+    if ch_state.get("draft"):
+        goals = st.text_input("Revision goals (e.g., tighten intro, add example)")
+        if st.button("Revise chapter"):
+            msgs = [
+                {"role":"system","content":"You are a meticulous editor. Reply in Markdown."},
+                {"role":"user","content":f"Revise the chapter to meet these goals: {goals or 'Improve clarity and flow; preserve voice and length.'}\n\nChapter:\n{ch_state['draft']}"}
+            ]
+            resp = client.chat.completions.create(model=chat_model, temperature=0.5, messages=msgs)
+            ch_state["draft"] = resp.choices[0].message.content
+            st.success("Revised.")
+            st.markdown(ch_state["draft"])
+
+# ---------------- EXPORT ----------------
+with tab_export:
+    st.subheader("Export manuscript (Markdown)")
+    ordered = sorted([(k, v) for k, v in plan["chapters"].items() if v.get("draft")], key=lambda x: int(x[0]))
+    if not ordered:
+        st.info("Draft at least one chapter first.")
+    else:
+        manuscript = f"# {plan['title']}\n\n*Thesis:* {plan['thesis']}\n\n"
+        for k, v in ordered:
+            manuscript += f"\n\n# Chapter {k}: {v.get('title','')}\n\n{v.get('draft','')}\n"
+        st.download_button("Download Markdown", manuscript, file_name=f"{plan['title'].replace(' ','_')}.md")
