@@ -200,6 +200,26 @@ with st.sidebar:
     overlap = st.slider("Chunk overlap", 50, 400, 200, 10)
     tag_filter = st.text_input("Tag filter (comma-sep, optional)", value="")
 
+st.sidebar.divider()
+st.sidebar.markdown("### 🧪 GitHub connection test")
+try:
+    owner, repo, branch = gh_repo_info()
+    token_present = bool(_sec("GITHUB_TOKEN"))
+    st.sidebar.write("Owner:", owner or "❌")
+    st.sidebar.write("Repo:", repo or "❌")
+    st.sidebar.write("Branch:", branch)
+    st.sidebar.write("Has token:", token_present)
+    if st.sidebar.button("List /uploads in repo"):
+        files = gh_list_dir("uploads")
+        if not files:
+            st.sidebar.info("No files in /uploads (yet).")
+        else:
+            for f in files:
+                st.sidebar.write("•", f.get("name"))
+except Exception as e:
+    st.sidebar.error(f"GitHub test failed: {e}")
+
+
 tab_sources, tab_outline, tab_draft, tab_export = st.tabs(
     ["📥 Sources", "🧭 Outline", "✍️ Draft", "📤 Export"]
 )
