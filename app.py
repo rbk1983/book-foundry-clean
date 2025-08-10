@@ -1,3 +1,4 @@
+
 import os, sys, time, math, hashlib, base64, json
 from typing import List, Dict, Any
 
@@ -178,7 +179,7 @@ if "plan" not in st.session_state:
         "title": "My Third Book",
         "thesis": "",
         "style": "",
-        "chapters": {}  # "1": {"title": "...", "synopsis": "...", "draft": "..."}
+        "chapters": {}  # "1": {"title": "...", "synopsis": "...", "draft": "...}
     }
 
 if "corpus" not in st.session_state:
@@ -189,7 +190,7 @@ plan = st.session_state.plan
 corpus: List[Dict[str, Any]] = st.session_state.corpus
 
 # ==================== Sidebar settings ====================
-st.title("📚 Book Foundry — GitHub-persist (clean start)")
+st.title("📚 Book Foundry — GitHub-persist (clean)")
 st.caption("Uploads → in-memory embeddings → outline/draft. Files persisted to your private GitHub repo.")
 
 with st.sidebar:
@@ -254,36 +255,10 @@ with st.sidebar:
             link_branch = branch or "main"
             link = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res.get('content',{}).get('path', path_rel)}"
             st.success("Wrote: " + link)
+        except httpx.HTTPStatusError as e:
+            st.error(f"Write failed: {e}\n\n{e.response.text[:500]}")
         except Exception as e:
-            st.error(f"Write failed: {e}")
-
-st.markdown("#### 🔍 Find my repo")
-if st.button("List my repos (first 100)"):
-    try:
-        with httpx.Client(timeout=30.0, headers=gh_headers()) as c:
-            r = c.get("https://api.github.com/user/repos", params={"per_page": 100, "page": 1})
-            st.write("Status:", r.status_code)
-            if r.status_code != 200:
-                st.error(r.text[:300])
-            else:
-                found = False
-                data = r.json()
-                for item in data:
-                    owner_login = (item.get("owner") or {}).get("login")
-                    name = item.get("name")
-                    if owner_login and name:
-                        st.write(f"- {owner_login}/{name}")
-                    if owner_login == (gh_repo_info()[0] or "") and name == (gh_repo_info()[1] or ""):
-                        found = True
-                if not data:
-                    st.info("No repos returned (page 1).")
-                if found:
-                    st.success("✅ Target repo FOUND in your list.")
-                else:
-                    st.warning("⚠️ Target repo NOT found. Check GH_REPO_OWNER / GH_REPO_NAME spelling.")
-    except Exception as e:
-        st.error(f"List repos error: {e}")
-
+            st.error(f"Write failed (generic): {e}")
 
 # ==================== Tabs ====================
 tab_sources, tab_outline, tab_draft, tab_export = st.tabs(
@@ -320,9 +295,12 @@ with tab_sources:
                         res = gh_put_file(gh_rel, raw_bytes, f"Add upload {f.name}")
                         gh_path = res.get("content", {}).get("path", gh_rel)
                         uploaded_to_gh.append(gh_path)
+                    except httpx.HTTPStatusError as e:
+                        st.error(f"GitHub upload failed for {f.name}: {e}\n\n{e.response.text[:500]}")
+                        continue  # skip ingest if persistence failed
                     except Exception as e:
                         st.error(f"GitHub upload failed for {f.name}: {e}")
-                        continue  # skip ingest if persistence failed
+                        continue
 
                 # also save to temp so we can parse now
                 tmp = os.path.join("data", f"{int(time.time())}_{f.name}")
@@ -387,6 +365,8 @@ with tab_sources:
                         })
                         reingested += 1
                 st.success(f"Restored {len(items)} file(s) → {reingested} chunks.")
+        except httpx.HTTPStatusError as e:
+            st.error(f"GitHub restore failed: {e}\n\n{e.response.text[:500]}")
         except Exception as e:
             st.error(f"GitHub restore failed: {e}")
 
@@ -404,7 +384,7 @@ with tab_outline:
             {"role":"system","content":"You are a meticulous long-form book-writing assistant. Reply in clean Markdown."},
             {"role":"user","content":f"Plan a new book.\n\nThesis:\n{plan['thesis']}\n\nConstraints: 12–18 chapters, coherent arc.\nProduce title options, detailed TOC, 2–4 sentence synopsis per chapter, and a brief style sheet."}
         ]
-        resp = client.chat.completions.create(model=st.session_state.get("chat_model", "gpt-4o") or "gpt-4o",
+        resp = client.chat.completions.create(model= (st.session_state.get("chat_model") or "gpt-4o"),
                                               temperature=temperature, messages=msgs)
         st.markdown(resp.choices[0].message.content)
         st.info("Copy/paste chapter titles & synopses into the Draft tab.")
