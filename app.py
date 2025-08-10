@@ -2,6 +2,83 @@ import os, sys, time, math, hashlib
 import streamlit as st
 from typing import List, Dict, Any
 
+# --- GitHub persistence helpers ---
+import base64, json, httpx
+
+def _sec(name: str):
+    # Safe secrets/env access (no .get on st.secrets)
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name)
+
+def gh_headers():
+    tok = _sec("GITHUB_TOKEN")
+    return {
+        "Authorization": f"Bearer {tok}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+def gh_repo_info():
+    owner  = _sec("GH_REPO_OWNER")
+    repo   = _sec("GH_REPO_NAME")
+    branch = _sec("GH_BRANCH") or "main"
+    return owner, repo, branch
+
+def gh_put_file(path_rel: str, content_bytes: bytes, message: str) -> dict:
+    owner, repo, branch = gh_repo_info()
+    if not (owner and repo):
+        raise RuntimeError("GH_REPO_OWNER or GH_REPO_NAME missing in Secrets.")
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
+    with httpx.Client(timeout=60.0) as c:
+        # Check if file exists to include SHA
+        sha = None
+        r0 = c.get(url, params={"ref": branch}, headers=gh_headers())
+        if r0.status_code == 200:
+            sha = r0.json().get("sha")
+        elif r0.status_code not in (404, 200):
+            r0.raise_for_status()
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content_bytes).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        r = c.put(url, headers=gh_headers(), data=json.dumps(payload))
+        r.raise_for_status()
+        return r.json()  # contains 'content': {'path': 'uploads/…', 'sha': …}
+
+def gh_list_dir(path_rel: str) -> list[dict]:
+    owner, repo, branch = gh_repo_info()
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
+    with httpx.Client(timeout=30.0) as c:
+        r = c.get(url, params={"ref": branch}, headers=gh_headers())
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        items = r.json()
+        return [i for i in items if i.get("type") == "file"]
+
+def gh_get_file(path_rel: str) -> bytes:
+    owner, repo, branch = gh_repo_info()
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
+    with httpx.Client(timeout=60.0) as c:
+        r = c.get(url, params={"ref": branch}, headers=gh_headers())
+        r.raise_for_status()
+        data = r.json()
+        if data.get("encoding") == "base64":
+            return base64.b64decode(data["content"])
+        if "download_url" in data:
+            r2 = c.get(data["download_url"])
+            r2.raise_for_status()
+            return r2.content
+        return b""
+
+
 # ---------------- Diagnostics (render first) ----------------
 st.set_page_config(page_title="Book Foundry — No-DB (Py3.13 ready)", layout="wide")
 st.sidebar.markdown("### 🔎 Diagnostics")
