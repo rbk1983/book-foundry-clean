@@ -205,12 +205,19 @@ with st.sidebar:
         st.write("Branch:", branch)
         st.write("Has token:", token_present)
         if st.button("List /uploads in repo"):
-            files = gh_list_dir("uploads")
-            if not files:
-                st.info("No files in /uploads (yet).")
-            else:
-                for f in files:
-                    st.write("•", f.get("name"))
+          st.sidebar.markdown("#### Write test file")
+if st.sidebar.button("Create test file in /uploads"):
+    try:
+        ts = int(time.time())
+        path_rel = f"uploads/test_{ts}.txt"
+        res = gh_put_file(path_rel, f"hello from streamlit at {ts}\n".encode("utf-8"),
+                          f"Add test file {ts}")
+        owner, repo, branch = gh_repo_info()
+        link = f"https://github.com/{owner}/{repo}/blob/{(branch or 'main')}/{res.get('content',{}).get('path', path_rel)}"
+        st.sidebar.success("Wrote: " + link)
+    except Exception as e:
+        st.sidebar.error(f"Write failed: {e}")
+
     except Exception as e:
         st.error(f"GitHub test failed: {e}")
 
