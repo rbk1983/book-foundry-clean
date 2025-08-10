@@ -3,7 +3,7 @@ from typing import List, Dict, Any
 
 import streamlit as st
 
-# -------------------- Page + Diagnostics --------------------
+# ==================== Page + Diagnostics ====================
 st.set_page_config(page_title="Book Foundry — GitHub-persist (Py3.13 ready)", layout="wide")
 
 st.sidebar.markdown("### 🔎 Diagnostics")
@@ -21,9 +21,7 @@ try:
 except Exception as e:
     st.sidebar.write("httpx import error:", e)
 
-# -------------------- OpenAI client (safe init) --------------------
-from openai import OpenAI
-
+# ==================== Secrets helper ====================
 def _sec(name: str):
     """Safe access for Streamlit secrets/env (no .get on st.secrets)."""
     try:
@@ -33,6 +31,9 @@ def _sec(name: str):
         pass
     return os.getenv(name)
 
+# ==================== OpenAI client (safe init) ====================
+from openai import OpenAI
+
 OPENAI_KEY = _sec("OPENAI_API_KEY")
 st.sidebar.write("Has OPENAI_API_KEY:", bool(OPENAI_KEY))
 if not OPENAI_KEY:
@@ -41,7 +42,7 @@ if not OPENAI_KEY:
 
 client = OpenAI(api_key=OPENAI_KEY)
 
-# -------------------- GitHub helpers (persistence) --------------------
+# ==================== GitHub helpers (persistence) ====================
 import httpx
 
 def gh_headers():
@@ -55,7 +56,7 @@ def gh_headers():
 def gh_repo_info():
     owner  = _sec("GH_REPO_OWNER")
     repo   = _sec("GH_REPO_NAME")
-    branch = _sec("GH_BRANCH") or "main"
+    branch = _sec("GH_BRANCH")  # may be None/empty -> use repo default
     return owner, repo, branch
 
 def gh_put_file(path_rel: str, content_bytes: bytes, message: str) -> dict:
@@ -64,21 +65,23 @@ def gh_put_file(path_rel: str, content_bytes: bytes, message: str) -> dict:
     if not (owner and repo):
         raise RuntimeError("GH_REPO_OWNER or GH_REPO_NAME missing in Secrets.")
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
+    params = {"ref": branch} if branch else None
     with httpx.Client(timeout=60.0) as c:
         # Check if exists to include SHA
-        sha = None
-        r0 = c.get(url, params={"ref": branch}, headers=gh_headers())
-        if r0.status_code == 200:
-            sha = r0.json().get("sha")
-        elif r0.status_code not in (404, 200):
+        r0 = c.get(url, params=params, headers=gh_headers())
+        sha = r0.json().get("sha") if r0.status_code == 200 else None
+        if r0.status_code not in (200, 404):
             r0.raise_for_status()
+
         payload = {
             "message": message,
             "content": base64.b64encode(content_bytes).decode("utf-8"),
-            "branch": branch,
         }
+        if branch:
+            payload["branch"] = branch
         if sha:
             payload["sha"] = sha
+
         r = c.put(url, headers=gh_headers(), data=json.dumps(payload))
         r.raise_for_status()
         return r.json()
@@ -87,9 +90,15 @@ def gh_list_dir(path_rel: str) -> List[dict]:
     """List files under path_rel. Returns list of items (dicts)."""
     owner, repo, branch = gh_repo_info()
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
+    params = {"ref": branch} if branch else None
     with httpx.Client(timeout=30.0) as c:
-        r = c.get(url, params={"ref": branch}, headers=gh_headers())
+        r = c.get(url, params=params, headers=gh_headers())
         if r.status_code == 404:
+            # Distinguish between "repo not accessible" and "folder not found"
+            r_repo = c.get(f"https://api.github.com/repos/{owner}/{repo}", headers=gh_headers())
+            if r_repo.status_code != 200:
+                raise RuntimeError(f"Repo {owner}/{repo} not accessible (status {r_repo.status_code}).")
+            # Repo exists -> just no /uploads yet
             return []
         r.raise_for_status()
         items = r.json()
@@ -99,8 +108,9 @@ def gh_get_file(path_rel: str) -> bytes:
     """Fetch file content bytes from repo/path."""
     owner, repo, branch = gh_repo_info()
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
+    params = {"ref": branch} if branch else None
     with httpx.Client(timeout=60.0) as c:
-        r = c.get(url, params={"ref": branch}, headers=gh_headers())
+        r = c.get(url, params=params, headers=gh_headers())
         r.raise_for_status()
         data = r.json()
         if data.get("encoding") == "base64":
@@ -111,7 +121,7 @@ def gh_get_file(path_rel: str) -> bytes:
             return r2.content
         return b""
 
-# -------------------- Loaders, chunking, embeddings --------------------
+# ==================== Loaders, chunking, embeddings ====================
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from markdown import markdown
@@ -162,7 +172,7 @@ def cosine_sim(a: List[float], b: List[float]) -> float:
 def sha16(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-# -------------------- Session state --------------------
+# ==================== Session state ====================
 if "plan" not in st.session_state:
     st.session_state.plan = {
         "title": "My Third Book",
@@ -178,7 +188,7 @@ if "corpus" not in st.session_state:
 plan = st.session_state.plan
 corpus: List[Dict[str, Any]] = st.session_state.corpus
 
-# -------------------- Sidebar settings --------------------
+# ==================== Sidebar settings ====================
 st.title("📚 Book Foundry — GitHub-persist (clean start)")
 st.caption("Uploads → in-memory embeddings → outline/draft. Files persisted to your private GitHub repo.")
 
@@ -202,31 +212,57 @@ with st.sidebar:
         token_present = bool(_sec("GITHUB_TOKEN"))
         st.write("Owner:", owner or "❌")
         st.write("Repo:", repo or "❌")
-        st.write("Branch:", branch)
+        st.write("Branch:", branch or "(repo default)")
         st.write("Has token:", token_present)
         if st.button("List /uploads in repo"):
-          st.sidebar.markdown("#### Write test file")
-if st.sidebar.button("Create test file in /uploads"):
-    try:
-        ts = int(time.time())
-        path_rel = f"uploads/test_{ts}.txt"
-        res = gh_put_file(path_rel, f"hello from streamlit at {ts}\n".encode("utf-8"),
-                          f"Add test file {ts}")
-        owner, repo, branch = gh_repo_info()
-        link = f"https://github.com/{owner}/{repo}/blob/{(branch or 'main')}/{res.get('content',{}).get('path', path_rel)}"
-        st.sidebar.success("Wrote: " + link)
-    except Exception as e:
-        st.sidebar.error(f"Write failed: {e}")
-
+            files = gh_list_dir("uploads")
+            if not files:
+                st.info("No files in /uploads (yet).")
+            else:
+                for f in files:
+                    st.write("•", f.get("name"))
     except Exception as e:
         st.error(f"GitHub test failed: {e}")
 
-# -------------------- Tabs --------------------
+    st.markdown("#### Token sanity checks")
+    if st.button("Test /user and repo access"):
+        try:
+            with httpx.Client(timeout=30.0, headers=gh_headers()) as c:
+                u = c.get("https://api.github.com/user")
+                st.write("/user status:", u.status_code)
+                if u.status_code == 200:
+                    st.write("Authenticated as:", u.json().get("login"))
+                else:
+                    st.error(f"/user error: {u.text[:200]}")
+
+                r = c.get(f"https://api.github.com/repos/{owner}/{repo}")
+                st.write("/repos status:", r.status_code)
+                if r.status_code == 200:
+                    st.success("Repo is accessible ✅")
+                else:
+                    st.error(f"/repos error: {r.text[:200]}")
+        except Exception as e:
+            st.error(f"Token test failed: {e}")
+
+    st.markdown("#### Write test file")
+    if st.button("Create test file in /uploads"):
+        try:
+            ts = int(time.time())
+            path_rel = f"uploads/test_{ts}.txt"
+            res = gh_put_file(path_rel, f"hello from streamlit at {ts}\n".encode("utf-8"),
+                              f"Add test file {ts}")
+            link_branch = branch or "main"
+            link = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res.get('content',{}).get('path', path_rel)}"
+            st.success("Wrote: " + link)
+        except Exception as e:
+            st.error(f"Write failed: {e}")
+
+# ==================== Tabs ====================
 tab_sources, tab_outline, tab_draft, tab_export = st.tabs(
     ["📥 Sources", "🧭 Outline", "✍️ Draft", "📤 Export"]
 )
 
-# -------------------- SOURCES --------------------
+# ==================== SOURCES ====================
 with tab_sources:
     st.subheader("Upload sources (PDF/DOCX/MD/TXT)")
     files = st.file_uploader("Select files", type=["pdf","docx","md","markdown","txt"], accept_multiple_files=True)
@@ -285,8 +321,9 @@ with tab_sources:
             st.success(f"Ingested {len(files)} file(s) → {added_chunks} chunks.")
             if uploaded_to_gh:
                 owner, repo, branch = gh_repo_info()
+                link_branch = branch or "main"
                 st.info("Saved to GitHub:\n" + "\n".join(
-                    [f"- https://github.com/{owner}/{repo}/blob/{branch}/{p}" for p in uploaded_to_gh]
+                    [f"- https://github.com/{owner}/{repo}/blob/{link_branch}/{p}" for p in uploaded_to_gh]
                 ))
 
     if corpus:
@@ -325,7 +362,7 @@ with tab_sources:
         except Exception as e:
             st.error(f"GitHub restore failed: {e}")
 
-# -------------------- OUTLINE --------------------
+# ==================== OUTLINE ====================
 with tab_outline:
     st.subheader("Thesis & Style")
     c1, c2 = st.columns(2)
@@ -339,11 +376,12 @@ with tab_outline:
             {"role":"system","content":"You are a meticulous long-form book-writing assistant. Reply in clean Markdown."},
             {"role":"user","content":f"Plan a new book.\n\nThesis:\n{plan['thesis']}\n\nConstraints: 12–18 chapters, coherent arc.\nProduce title options, detailed TOC, 2–4 sentence synopsis per chapter, and a brief style sheet."}
         ]
-        resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
+        resp = client.chat.completions.create(model=st.session_state.get("chat_model", "gpt-4o") or "gpt-4o",
+                                              temperature=temperature, messages=msgs)
         st.markdown(resp.choices[0].message.content)
         st.info("Copy/paste chapter titles & synopses into the Draft tab.")
 
-# -------------------- Retrieval (in-memory) --------------------
+# ==================== Retrieval (in-memory) ====================
 def retrieve(query: str, k: int, tag_filter_text: str) -> List[Dict[str, Any]]:
     if not corpus:
         return []
@@ -358,10 +396,12 @@ def retrieve(query: str, k: int, tag_filter_text: str) -> List[Dict[str, Any]]:
     scored.sort(key=lambda x: x[0], reverse=True)
     return [r for _, r in scored[:k]]
 
-# -------------------- DRAFT --------------------
+# ==================== DRAFT ====================
 with tab_draft:
     st.subheader("Draft a chapter")
-    ch_num = st.text_input("Chapter number", value=(list(plan["chapters"].keys())[:1] or ["1"])[0])
+    current_keys = list(plan["chapters"].keys())
+    default_ch = current_keys[0] if current_keys else "1"
+    ch_num = st.text_input("Chapter number", value=default_ch)
     ch_state = plan["chapters"].setdefault(ch_num, {"title":"", "synopsis":"", "draft":""})
     ch_state["title"] = st.text_input("Chapter title", value=ch_state["title"])
     ch_state["synopsis"] = st.text_area("Chapter synopsis", value=ch_state["synopsis"], height=100)
@@ -408,7 +448,7 @@ Write a cohesive chapter in Markdown with:
             st.success("Revised.")
             st.markdown(ch_state["draft"])
 
-# -------------------- EXPORT --------------------
+# ==================== EXPORT ====================
 with tab_export:
     st.subheader("Export manuscript (Markdown)")
     ordered = sorted([(k, v) for k, v in plan["chapters"].items() if v.get("draft")], key=lambda x: int(x[0]))
