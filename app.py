@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 import streamlit as st
 
 # ==================== Page + Diagnostics ====================
-st.set_page_config(page_title="Book Foundry — GitHub-persist (Py3.13 ready)", layout="wide")
+st.set_page_config(page_title="AI Book Studio", layout="wide")
 
 st.sidebar.markdown("### 🔎 Diagnostics")
 st.sidebar.write("Python:", sys.version)
@@ -190,7 +190,7 @@ plan = st.session_state.plan
 corpus: List[Dict[str, Any]] = st.session_state.corpus
 
 # ==================== Sidebar settings ====================
-st.title("📚 Book Foundry — GitHub-persist (clean)")
+st.title("📚 AI Book Studio")
 st.caption("Uploads → in-memory embeddings → outline/draft. Files persisted to your private GitHub repo.")
 
 with st.sidebar:
