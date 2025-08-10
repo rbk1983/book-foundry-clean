@@ -257,6 +257,34 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Write failed: {e}")
 
+st.markdown("#### 🔍 Find my repo")
+if st.button("List my repos (first 100)"):
+    try:
+        with httpx.Client(timeout=30.0, headers=gh_headers()) as c:
+            r = c.get("https://api.github.com/user/repos", params={"per_page": 100, "page": 1})
+            st.write("Status:", r.status_code)
+            if r.status_code != 200:
+                st.error(r.text[:300])
+            else:
+                found = False
+                data = r.json()
+                for item in data:
+                    owner_login = (item.get("owner") or {}).get("login")
+                    name = item.get("name")
+                    if owner_login and name:
+                        st.write(f"- {owner_login}/{name}")
+                    if owner_login == (gh_repo_info()[0] or "") and name == (gh_repo_info()[1] or ""):
+                        found = True
+                if not data:
+                    st.info("No repos returned (page 1).")
+                if found:
+                    st.success("✅ Target repo FOUND in your list.")
+                else:
+                    st.warning("⚠️ Target repo NOT found. Check GH_REPO_OWNER / GH_REPO_NAME spelling.")
+    except Exception as e:
+        st.error(f"List repos error: {e}")
+
+
 # ==================== Tabs ====================
 tab_sources, tab_outline, tab_draft, tab_export = st.tabs(
     ["📥 Sources", "🧭 Outline", "✍️ Draft", "📤 Export"]
