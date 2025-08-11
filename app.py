@@ -693,6 +693,16 @@ with tab_draft:
         prefill_q = st.session_state["__prefill_query_hint__"]
         del st.session_state["__prefill_query_hint__"]
         query_hint = st.text_input("Optional retrieval hint (keywords)", value=prefill_q)
+
+    ref_urls = st.text_area(
+        "Reference URLs for web facts (optional — one per line)",
+        placeholder="https://example.com/industry-report
+https://another.com/profile",
+        height=100
+    )
+    urls_list = [u.strip() for u in (ref_urls or "").splitlines() if u.strip()]
+    urls_block = "
+".join(f"- {u}" for u in urls_list) if urls_list else "(none provided)"
     else:
         query_hint = st.text_input("Optional retrieval hint (keywords)")
 
@@ -737,14 +747,20 @@ Draft Section {si} (~{section_words} words) for Chapter {ch_num}: "{ch_state['ti
 Follow this approved section plan:
 {section_plan}
 
-Constraints:
-- Write ONLY Section {si}. Do not draft other sections.
-- Maintain voice and pacing. Avoid repetition with prior sections.
-- Use context notes below; paraphrase and attribute facts as [S1], [S2], etc. where appropriate.
-- End Section {si} with a line that naturally sets up the next section.
-
-Context notes:
+Context notes (from my uploaded books; paraphrase as needed):
 {context}
+
+Reference URLs for any *web-sourced facts* (only cite if you use them here):
+{urls_block}
+
+MANDATORY RULES
+- Write ONLY Section {si}. Do not draft other sections.
+- Keep a single "## Conclusion" for the final section ONLY. If this is not the last section, do NOT write any conclusion section.
+- If you use a verbatim quote from my books, put it in quotes and attribute inline as:
+  — [Full Name], [Role/Title] at [Hotel/Restaurant] ([Country])
+- Paraphrased book content: no citation.
+- Web-sourced facts/figures: add a Markdown hyperlink to the source URL right where it appears.
+- Maintain voice, no repetition, smooth handoff line to the next section.
 """.strip()
                     msgs = [
                         {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
@@ -758,11 +774,23 @@ Context notes:
                 # Stitch + polish
                 stitch_prompt = f"""
 Combine the sections below into a cohesive chapter (~{target_words} words).
-Keep the existing text; smooth transitions; remove duplicates; consistent headings (## / ###).
-Open with a strong hook and close with a forward-looking ending to tee up the next chapter.
+Keep the existing text; smooth transitions; remove duplicates; normalize headings.
+
+CRITICAL STRUCTURE RULES
+- There must be exactly ONE "## Conclusion" section, and it must be the final section in the chapter.
+- If earlier sections introduced any conclusion-like heading, merge their content into regular sections and remove the extra conclusion headings.
+
+ATTRIBUTION RULES
+- Preserve all inline attributions for verbatim quotes from my books:
+  “quote text” — [Full Name], [Role/Title] at [Hotel/Restaurant] ([Country])
+- Keep web hyperlinks where used; do not invent links; do not add citations to paraphrased book content.
 
 Sections:
-{"\n\n---\n\n".join(assembled)}
+{"
+
+---
+
+".join(assembled)}
 """.strip()
                 msgs = [
                     {"role":"system","content":"You are a meticulous editor. Reply in Markdown."},
