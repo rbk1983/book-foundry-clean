@@ -1,11 +1,11 @@
 
-import os, sys, time, math, hashlib, base64, json, re
+import os, sys, time, math, hashlib, base64, json, re, datetime as dt
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
 
 # ------------------ Page ------------------
-st.set_page_config(page_title="Book Auto-Generator (v2)", layout="wide")
+st.set_page_config(page_title="Book Auto-Generator (v3)", layout="wide")
 
 # ------------------ Diagnostics ------------------
 with st.sidebar:
@@ -93,13 +93,59 @@ def gh_list_dir(path_rel: str) -> List[dict]:
         items = r.json()
         return [i for i in items if i.get("type") == "file"]
 
+# ------------------ Tavily web search helper ------------------
+def tavily_search(query: str,
+                  max_results: int = 6,
+                  include_domains: Optional[List[str]] = None,
+                  exclude_domains: Optional[List[str]] = None,
+                  search_depth: str = "advanced",
+                  days: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Calls Tavily /search API. Returns list of dicts with keys: url, title, content, score (when available).
+    """
+    api_key = _sec("TAVILY_API_KEY")
+    if not api_key:
+        return []
+
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": max_results,
+        "search_depth": search_depth,  # "basic" or "advanced"
+        "include_answer": False,
+        "include_raw_content": False,
+        "source": "book-autogen"
+    }
+    if include_domains:
+        payload["include_domains"] = include_domains
+    if exclude_domains:
+        payload["exclude_domains"] = exclude_domains
+    if days is not None:
+        payload["days"] = days
+
+    try:
+        with httpx.Client(timeout=40.0) as c:
+            r = c.post("https://api.tavily.com/search", json=payload)
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("results", [])
+            out = []
+            for rr in results:
+                out.append({
+                    "url": rr.get("url"),
+                    "title": rr.get("title"),
+                    "content": rr.get("content", ""),
+                    "score": rr.get("score", 0.0)
+                })
+            return out
+    except Exception:
+        return []
+
 # ------------------ Text loaders & chunking ------------------
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-from docx.shared import Pt, Inches
+from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 from markdown import markdown
 from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -175,6 +221,7 @@ with st.sidebar:
     owner, repo, branch = gh_repo_info()
     st.write("Repo:", f"{owner}/{repo}" if owner and repo else "❌")
     st.write("Branch:", branch or "(default)")
+    st.write("Tavily key:", "✅" if _sec("TAVILY_API_KEY") else "—")
     st.divider()
     st.markdown("**Models**")
     st.session_state.model = st.text_input("Chat model", value=st.session_state.model)
@@ -273,9 +320,22 @@ num_chapters = st.number_input("Number of chapters (auto mode)", 8, 20, 12, 1)
 words_per_chapter = st.number_input("Target words per chapter", 1200, 8000, 3500, 100)
 
 st.markdown("**Web research** (optional)")
-use_web = st.checkbox("Enable web research with URLs below (for facts/figures only)")
+use_web = st.checkbox("Enable manual web references (paste URLs below)", value=False)
 ref_urls = st.text_area("Reference URLs (one per line)", placeholder="https://example.com/report\nhttps://another.com/profile", height=100)
 urls_list = [u.strip() for u in ref_urls.splitlines() if u.strip()] if use_web else []
+
+st.markdown("**Web research guidance (Tavily auto-search, optional)**")
+research_guidance = st.text_area(
+    "Tell the system how to search and what to prioritize (e.g., peer‑reviewed since 2019, meta-analyses, add journal/DOI links, include leading industry reports).",
+    height=120,
+    placeholder="Prioritize recent peer‑reviewed research (2019+), systematic reviews, and meta‑analyses. Add inline links to journals or DOIs. Include major industry reports if relevant."
+)
+use_tavily = st.checkbox("Use Tavily web research automatically", value=True)
+max_sources_per_chapter = st.slider("Max Tavily sources per chapter", 2, 12, 6, 1)
+prefer_academic = st.checkbox("Prefer academic/journal sources", value=True)
+recent_year_cutoff = st.number_input("Prefer sources published ≥ this year (0 to ignore)", min_value=0, max_value=2100, value=2019, step=1)
+include_domains_txt = st.text_input("Include only these domains (comma‑separated, optional)", value="")
+exclude_domains_txt = st.text_input("Exclude these domains (comma‑separated, optional)", value="")
 
 if outline_mode == "I will paste an outline":
     pasted_outline = st.text_area("Paste your chapter list (one per line; optional synopsis after a dash):", height=160, placeholder="Chapter 1: Title — optional synopsis\nChapter 2: ...")
@@ -352,8 +412,13 @@ Context (may be empty):
     resp = client.chat.completions.create(model=st.session_state.model, temperature=0.4, messages=msgs, max_tokens=600)
     return resp.choices[0].message.content
 
-def draft_section(si: int, sections_total: int, ch_num: str, ch_title: str, ch_synopsis: str, section_words: int, section_plan: str, context: str, urls: List[str]) -> str:
+def draft_section(si: int, sections_total: int, ch_num: str, ch_title: str, ch_synopsis: str, section_words: int, section_plan: str, context: str, urls: List[str], guidance: str, year_cutoff: int) -> str:
     urls_block = "\n".join(f"- {u}" for u in urls) if urls else "(none)"
+    guidance_text = guidance.strip() if guidance else ""
+    recency_line = ""
+    if isinstance(year_cutoff, int) and year_cutoff > 0:
+        recency_line = f"Prefer sources published in {year_cutoff} or later when citing web material."
+
     prompt = f"""
 Write Section {si} (~{section_words} words) for Chapter {ch_num}: "{ch_title}".
 Follow this approved section plan:
@@ -366,6 +431,10 @@ Context from my books (may be empty; paraphrase freely; you may quote verbatim o
 
 Web references (cite ONLY if you actually use a fact; add inline Markdown links): 
 {urls_block}
+
+Additional research guidance (apply if web links are provided):
+{guidance_text}
+{recency_line}
 
 MANDATORY RULES
 - Write ONLY Section {si}. Do not draft other sections.
@@ -393,7 +462,7 @@ CRITICAL RULES
 - Exactly ONE "## Conclusion" at the end. If earlier sections added any conclusion-like headings, merge their content into regular sections and remove the extra heading.
 - Preserve all inline attributions for verbatim quotes from my books:
   “quote” — Full Name, Role/Title at Hotel/Restaurant (Country)
-- Keep web hyperlinks where used; do not invent links; do not add citations to paraphrased book content.
+- Keep web hyperlinks where used; do not invent links; do not add citations to paraphrased book content. Preserve the exact URL text when merging.
 
 Sections:
 {"\n\n---\n\n".join(sections)}
@@ -418,12 +487,10 @@ def dedup_boundary(old_text: str, new_text: str, lookback: int=120) -> str:
     return newt
 
 # ----------- Markdown → Docx (basic) -----------
-def add_hyperlink(paragraph, text, url):
-    # Fallback: append " (url)" to text. True hyperlinks in python-docx are nontrivial; this is a simple readable approach.
-    run = paragraph.add_run(text)
+def add_hyperlink_text(para, text, url):
+    run = para.add_run(text)
     run.font.underline = True
-    run.font.color.rgb = None  # default color
-    paragraph.add_run(f" ({url})")
+    para.add_run(f" ({url})")
 
 def md_to_docx(md_text: str, title: str, thesis: str) -> bytes:
     doc = DocxDocument()
@@ -446,9 +513,7 @@ def md_to_docx(md_text: str, title: str, thesis: str) -> bytes:
         elif line.startswith("### "):
             doc.add_heading(line[4:].strip(), level=3)
         else:
-            # very basic link handling [text](url) → "text (url)"
             para = doc.add_paragraph()
-            cursor = 0
             pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
             last = 0
             for m in pattern.finditer(line):
@@ -457,12 +522,11 @@ def md_to_docx(md_text: str, title: str, thesis: str) -> bytes:
                     para.add_run(before)
                 text = m.group(1)
                 url = m.group(2)
-                add_hyperlink(para, text, url)
+                add_hyperlink_text(para, text, url)
                 last = m.end()
             tail = line[last:]
             if tail:
                 para.add_run(tail)
-    # Save to bytes
     tmp = f"/mnt/data/_tmp_{int(time.time())}.docx"
     doc.save(tmp)
     with open(tmp, "rb") as f:
@@ -486,27 +550,6 @@ if generate:
         st.code(outline_text)
 
     # Parse outline
-    def parse_outline(text: str) -> List[Dict[str,str]]:
-        chapters = []
-        for line in text.replace("\r","\n").split("\n"):
-            m = re.match(r"^\s*Chapter\s+(\d+)\s*:\s*(.+)$", line.strip(), re.IGNORECASE)
-            if not m: 
-                continue
-            num = m.group(1).strip()
-            tail = m.group(2).strip()
-            title = tail
-            synopsis = ""
-            if "—" in tail:
-                parts = tail.split("—",1)
-                title = parts[0].strip()
-                synopsis = parts[1].strip()
-            elif "-" in tail:
-                parts = tail.split("-",1)
-                title = parts[0].strip()
-                synopsis = parts[1].strip()
-            chapters.append({"num":num, "title":title, "synopsis":synopsis})
-        return chapters
-
     chapters = parse_outline(outline_text)
     if not chapters:
         st.error("Could not parse any chapters from the outline. Make sure lines start with 'Chapter N:'")
@@ -526,6 +569,55 @@ if generate:
         hits = retrieve(query, k=top_k, tags=None) if records else []
         ctx = make_context(hits)
 
+        # ----- Chapter-specific web sources -----
+        manual_urls = urls_list[:] if urls_list else []
+
+        tavily_urls = []
+        if use_tavily and _sec("TAVILY_API_KEY"):
+            rq_parts = [
+                f"Topic: {ch_title}",
+                f"Synopsis: {ch_syn}",
+                f"Book thesis: {thesis}",
+            ]
+            if research_guidance.strip():
+                rq_parts.append(f"Guidance: {research_guidance.strip()}")
+            research_query = " | ".join(rq_parts)
+
+            include_domains = [d.strip() for d in include_domains_txt.split(",") if d.strip()] if include_domains_txt else None
+            exclude_domains = [d.strip() for d in exclude_domains_txt.split(",") if d.strip()] if exclude_domains_txt else None
+
+            days_window = None
+            if isinstance(recent_year_cutoff, int) and recent_year_cutoff > 0:
+                start = dt.datetime(recent_year_cutoff, 1, 1)
+                days_window = max(1, (dt.datetime.utcnow() - start).days)
+
+            raw = tavily_search(
+                query=research_query,
+                max_results=max_sources_per_chapter,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
+                search_depth="advanced",
+                days=days_window
+            )
+
+            if prefer_academic and raw:
+                def is_academic(u: str) -> bool:
+                    u = (u or "").lower()
+                    return any(x in u for x in [".edu", ".ac.", "nature.com", "science.org", "sciencedirect.com", "jstor.org", "springer", "wiley.com", "tandfonline.com", "cell.com", "nejm.org", "thelancet.com", "doi.org"])
+                raw_sorted = sorted(raw, key=lambda r: (not is_academic(r.get("url","")), -float(r.get("score",0.0))))
+            else:
+                raw_sorted = sorted(raw, key=lambda r: -float(r.get("score",0.0)))
+
+            tavily_urls = [r["url"] for r in raw_sorted if r.get("url")]
+
+        # Merge and dedupe URLs
+        effective_urls = []
+        seen = set()
+        for u in (manual_urls + tavily_urls):
+            if u not in seen:
+                effective_urls.append(u)
+                seen.add(u)
+
         # Section plan
         sections_target = max(5, min(8, int(round(words_per_chapter/600))))
         plan_text = chapter_section_plan(ch_num, ch_title, ch_syn, words_per_chapter, sections_target, ctx)
@@ -534,7 +626,7 @@ if generate:
         sec_texts = []
         per_sec = max(450, min(900, int(words_per_chapter/sections_target)))
         for si in range(1, sections_target+1):
-            s_txt = draft_section(si, sections_target, ch_num, ch_title, ch_syn, per_sec, plan_text, ctx, urls_list)
+            s_txt = draft_section(si, sections_target, ch_num, ch_title, ch_syn, per_sec, plan_text, ctx, effective_urls, research_guidance, recent_year_cutoff)
             if sec_texts:
                 s_txt = dedup_boundary(sec_texts[-1], s_txt, lookback=160)
             sec_texts.append(s_txt)
