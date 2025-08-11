@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 import streamlit as st
 
 # ------------------ Page ------------------
-st.set_page_config(page_title="Book Auto-Generator", layout="wide")
+st.set_page_config(page_title="Book Auto-Generator (v2)", layout="wide")
 
 # ------------------ Diagnostics ------------------
 with st.sidebar:
@@ -65,7 +65,6 @@ def gh_put_file(path_rel: str, content_bytes: bytes, message: str) -> dict:
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
     params = {"ref": branch} if branch else None
     with httpx.Client(timeout=60.0) as c:
-        # Check if exists to get sha
         r0 = c.get(url, params=params, headers=gh_headers())
         sha = r0.json().get("sha") if r0.status_code == 200 else None
         if r0.status_code not in (200, 404):
@@ -89,31 +88,18 @@ def gh_list_dir(path_rel: str) -> List[dict]:
     with httpx.Client(timeout=30.0) as c:
         r = c.get(url, params=params, headers=gh_headers())
         if r.status_code == 404:
-            # repo might exist but folder not yet
             return []
         r.raise_for_status()
         items = r.json()
         return [i for i in items if i.get("type") == "file"]
 
-def gh_get_file(path_rel: str) -> bytes:
-    owner, repo, branch = gh_repo_info()
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_rel}"
-    params = {"ref": branch} if branch else None
-    with httpx.Client(timeout=60.0) as c:
-        r = c.get(url, params=params, headers=gh_headers())
-        r.raise_for_status()
-        data = r.json()
-        if data.get("encoding") == "base64":
-            return base64.b64decode(data["content"])
-        if "download_url" in data:
-            r2 = c.get(data["download_url"])
-            r2.raise_for_status()
-            return r2.content
-        return b""
-
 # ------------------ Text loaders & chunking ------------------
 from pypdf import PdfReader
 from docx import Document as DocxDocument
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from markdown import markdown
 from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -156,7 +142,7 @@ def embed_texts(texts: List[str], model: str) -> List[List[float]]:
     texts = [t for t in texts if t and t.strip()]
     if not texts:
         return []
-    resp = client.embeddings.create(model=model, input=texts)
+    resp = client.embeddings.create(model=st.session_state.emb_model, input=texts)
     return [d.embedding for d in resp.data]
 
 def cosine_sim(a: List[float], b: List[float]) -> float:
@@ -208,9 +194,9 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"GitHub test failed: {e}")
 
-# ------------------ Ingest (minimal) ------------------
-st.subheader("1) Upload your source books (once)")
-files = st.file_uploader("PDF/DOCX/MD/TXT — your two books + any extras", type=["pdf","docx","md","markdown","txt"], accept_multiple_files=True)
+# ------------------ Ingest (optional) ------------------
+st.subheader("1) (Optional) Upload source books or materials")
+files = st.file_uploader("PDF/DOCX/MD/TXT — your books or any key sources", type=["pdf","docx","md","markdown","txt"], accept_multiple_files=True)
 tags_str = st.text_input("Tags for these files (comma-separated)", value="Books")
 persist = st.checkbox("Save originals to GitHub (/uploads)", value=True)
 
@@ -222,17 +208,14 @@ if st.button("Ingest selected files"):
         added = 0
         for f in files:
             b = f.read()
-            # Save to /data
             tmp = os.path.join("data", f"{int(time.time())}_{f.name}")
             with open(tmp, "wb") as out:
                 out.write(b)
-            # GitHub persist
             if persist:
                 try:
                     gh_put_file(f"uploads/{int(time.time())}_{f.name}", b, f"Add source {f.name}")
                 except Exception as e:
                     st.error(f"GitHub upload failed for {f.name}: {e}")
-            # Extract + chunk + embed
             try:
                 raw = load_text_from_file(tmp)
                 pieces = chunk_text(raw, chunk_size=chunk_size, overlap=chunk_overlap)
@@ -249,13 +232,16 @@ if st.button("Ingest selected files"):
             except Exception as e:
                 st.error(f"Failed to process {f.name}: {e}")
         st.success(f"Ingested: {len(files)} file(s) → {added} chunks.")
-st.caption(f"Corpus size: {len(records)} chunks.")
+st.caption(f"Corpus size: {len(records)} chunks. (Zero is okay — model + web URLs only mode)")
 
 # ------------------ Retrieve ------------------
 def retrieve(query: str, k: int, tags: Optional[List[str]]=None) -> List[Dict[str,Any]]:
     if not records or not query.strip():
         return []
-    qvec = embed_texts([query], model=st.session_state.emb_model)[0]
+    qvecs = embed_texts([query], model=st.session_state.emb_model)
+    if not qvecs:
+        return []
+    qvec = qvecs[0]
     scored = []
     tags_lower = set([t.lower() for t in (tags or [])])
     for r in records:
@@ -282,7 +268,7 @@ with col2:
     style = st.text_area("Voice & Style Sheet (tense, pacing, terminology, audience)", height=120)
 
 st.subheader("3) Outline & generation settings")
-outline_mode = st.radio("Outline source", ["Auto-generate from my books", "I will paste an outline"], index=0, horizontal=False)
+outline_mode = st.radio("Outline source", ["Auto-generate", "I will paste an outline"], index=0, horizontal=True)
 num_chapters = st.number_input("Number of chapters (auto mode)", 8, 20, 12, 1)
 words_per_chapter = st.number_input("Target words per chapter", 1200, 8000, 3500, 100)
 
@@ -292,7 +278,7 @@ ref_urls = st.text_area("Reference URLs (one per line)", placeholder="https://ex
 urls_list = [u.strip() for u in ref_urls.splitlines() if u.strip()] if use_web else []
 
 if outline_mode == "I will paste an outline":
-    pasted_outline = st.text_area("Paste your chapter list (one per line; you can add short synopses after a colon):", height=160, placeholder="Chapter 1: Title — optional synopsis\nChapter 2: ...")
+    pasted_outline = st.text_area("Paste your chapter list (one per line; optional synopsis after a dash):", height=160, placeholder="Chapter 1: Title — optional synopsis\nChapter 2: ...")
 else:
     pasted_outline = ""
 
@@ -311,14 +297,14 @@ Desired chapter count: {num_chapters}
 RULES
 - Use 10–14 chapters, coherent arc from premise → development → application → conclusion.
 - Each chapter gets a short, actionable synopsis (2–4 sentences).
-- Base structure primarily on the context from my two books; fill gaps with general knowledge.
+- If context from my books is minimal or absent, rely on your general knowledge; fill gaps with sensible structure.
 - Output format:
 Chapter 1: Title — 2–4 sentence synopsis
 Chapter 2: Title — synopsis
 ...
 Chapter N: Title — synopsis
 
-Context excerpts from my books (for inspiration):
+Context excerpts (may be empty):
 {context}
 """.strip()
     msgs = [
@@ -336,7 +322,6 @@ def parse_outline(text: str) -> List[Dict[str,str]]:
             continue
         num = m.group(1).strip()
         tail = m.group(2).strip()
-        # Title and optional synopsis after a dash
         title = tail
         synopsis = ""
         if "—" in tail:
@@ -357,7 +342,7 @@ Synopsis: {ch_synopsis}
 Create {sections} sections with short, specific titles (1 line each). Reserve the last section for "Conclusion" (exactly that word).
 No prose, just the numbered plan.
 
-Context (from my books):
+Context (may be empty):
 {context}
 """.strip()
     msgs = [
@@ -376,7 +361,7 @@ Follow this approved section plan:
 
 Synopsis: {ch_synopsis}
 
-Context from my books (paraphrase freely; you may quote verbatim only with attribution):
+Context from my books (may be empty; paraphrase freely; you may quote verbatim only with attribution):
 {context}
 
 Web references (cite ONLY if you actually use a fact; add inline Markdown links): 
@@ -427,25 +412,71 @@ def dedup_boundary(old_text: str, new_text: str, lookback: int=120) -> str:
     old_end = old[-lookback:].lower()
     new_start = newt[:lookback].lower()
     if old_end in new_start or new_start in old_end:
-        # trim minimal overlap
         for i in range(min(lookback, len(newt))):
             if old.endswith(newt[:i]):
                 return newt[i:]
     return newt
 
+# ----------- Markdown → Docx (basic) -----------
+def add_hyperlink(paragraph, text, url):
+    # Fallback: append " (url)" to text. True hyperlinks in python-docx are nontrivial; this is a simple readable approach.
+    run = paragraph.add_run(text)
+    run.font.underline = True
+    run.font.color.rgb = None  # default color
+    paragraph.add_run(f" ({url})")
+
+def md_to_docx(md_text: str, title: str, thesis: str) -> bytes:
+    doc = DocxDocument()
+    # Title page
+    h = doc.add_heading(title, level=0)
+    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p = doc.add_paragraph("\n")
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    t = doc.add_paragraph(f"Thesis: {thesis}")
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_page_break()
+
+    lines = md_text.replace("\r","\n").split("\n")
+    for line in lines:
+        if line.startswith("# "):
+            doc.add_heading(line[2:].strip(), level=1)
+        elif line.startswith("## "):
+            doc.add_heading(line[3:].strip(), level=2)
+        elif line.startswith("### "):
+            doc.add_heading(line[4:].strip(), level=3)
+        else:
+            # very basic link handling [text](url) → "text (url)"
+            para = doc.add_paragraph()
+            cursor = 0
+            pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+            last = 0
+            for m in pattern.finditer(line):
+                before = line[last:m.start()]
+                if before:
+                    para.add_run(before)
+                text = m.group(1)
+                url = m.group(2)
+                add_hyperlink(para, text, url)
+                last = m.end()
+            tail = line[last:]
+            if tail:
+                para.add_run(tail)
+    # Save to bytes
+    tmp = f"/mnt/data/_tmp_{int(time.time())}.docx"
+    doc.save(tmp)
+    with open(tmp, "rb") as f:
+        return f.read()
+
 # ------------------ Generation ------------------
 if generate:
-    if not records:
-        st.error("Please ingest your two books first.")
-        st.stop()
-
-    # Prepare overall context from top-k chunks relevant to thesis
-    thesis_hits = retrieve(thesis or book_title, k=top_k, tags=None)
+    # Prepare overall context from top-k chunks relevant to thesis (if any)
+    thesis_hits = retrieve(thesis or book_title, k=top_k, tags=None) if records else []
     thesis_ctx = make_context(thesis_hits)
 
     # 1) Outline
-    if outline_mode == "Auto-generate from my books":
-        st.info("Generating outline from your books…")
+    if outline_mode == "Auto-generate":
+        st.info("Generating outline…")
         outline_text = plan_outline(thesis_ctx)
         st.markdown("#### Proposed Outline")
         st.code(outline_text)
@@ -453,6 +484,28 @@ if generate:
         outline_text = pasted_outline
         st.markdown("#### Using your pasted outline")
         st.code(outline_text)
+
+    # Parse outline
+    def parse_outline(text: str) -> List[Dict[str,str]]:
+        chapters = []
+        for line in text.replace("\r","\n").split("\n"):
+            m = re.match(r"^\s*Chapter\s+(\d+)\s*:\s*(.+)$", line.strip(), re.IGNORECASE)
+            if not m: 
+                continue
+            num = m.group(1).strip()
+            tail = m.group(2).strip()
+            title = tail
+            synopsis = ""
+            if "—" in tail:
+                parts = tail.split("—",1)
+                title = parts[0].strip()
+                synopsis = parts[1].strip()
+            elif "-" in tail:
+                parts = tail.split("-",1)
+                title = parts[0].strip()
+                synopsis = parts[1].strip()
+            chapters.append({"num":num, "title":title, "synopsis":synopsis})
+        return chapters
 
     chapters = parse_outline(outline_text)
     if not chapters:
@@ -468,12 +521,12 @@ if generate:
         ch_num = ch["num"]; ch_title = ch["title"]; ch_syn = ch.get("synopsis","")
         progress.progress(idx/len(chapters), text=f"Drafting Chapter {ch_num}: {ch_title}")
 
-        # Retrieval for this chapter (use title + synopsis + prior key phrases)
-        query = f"{book_title} | {ch_title} | {ch_syn} | continuity cues: {prior_text[-600:] if prior_text else ''}"
-        hits = retrieve(query, k=top_k, tags=None)
+        # Retrieval for this chapter if we have records
+        query = f"{book_title} | {ch_title} | {ch_syn} | continuity: {prior_text[-600:] if prior_text else ''}"
+        hits = retrieve(query, k=top_k, tags=None) if records else []
         ctx = make_context(hits)
 
-        # Section plan (6 sections default, scale with length)
+        # Section plan
         sections_target = max(5, min(8, int(round(words_per_chapter/600))))
         plan_text = chapter_section_plan(ch_num, ch_title, ch_syn, words_per_chapter, sections_target, ctx)
 
@@ -482,7 +535,6 @@ if generate:
         per_sec = max(450, min(900, int(words_per_chapter/sections_target)))
         for si in range(1, sections_target+1):
             s_txt = draft_section(si, sections_target, ch_num, ch_title, ch_syn, per_sec, plan_text, ctx, urls_list)
-            # boundary dedup vs previous section
             if sec_texts:
                 s_txt = dedup_boundary(sec_texts[-1], s_txt, lookback=160)
             sec_texts.append(s_txt)
@@ -510,19 +562,41 @@ Aim for ~{per_sec}–{per_sec+200} words. Current ending:
         prior_text += f"\n\n[END CH {ch_num}]\n{ch_text}\n"
 
     progress.progress(1.0, text="Combining…")
-
     manuscript = "\n".join(manuscript_parts).strip()
 
-    # 3) Save to GitHub and offer download
+    # 3) Save to GitHub and offer downloads
     ts = int(time.time())
-    out_name = f"{book_title.replace(' ','_')}_{ts}.md"
-    st.download_button("⬇️ Download full manuscript (Markdown)", manuscript, file_name=out_name)
+    safe_title = re.sub(r"[^A-Za-z0-9_\-]+","_", book_title.strip()) or "Book"
+    md_name = f"{safe_title}_{ts}.md"
+    docx_name = f"{safe_title}_{ts}.docx"
 
+    # Download buttons
+    st.download_button("⬇️ Download manuscript (Markdown)", manuscript, file_name=md_name)
+
+    # Build a .docx version
     try:
-        res = gh_put_file(f"outputs/{out_name}", manuscript.encode("utf-8"), f"Add manuscript {out_name}")
+        docx_bytes = md_to_docx(manuscript, book_title, thesis)
+        st.download_button("⬇️ Download manuscript (Word .docx)", docx_bytes, file_name=docx_name)
+    except Exception as e:
+        st.warning(f"Could not generate .docx: {e}")
+        docx_bytes = None
+
+    # GitHub save
+    try:
+        res = gh_put_file(f"outputs/{md_name}", manuscript.encode("utf-8"), f"Add manuscript {md_name}")
         owner, repo, branch = gh_repo_info()
         link_branch = branch or "main"
-        gh_link = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res.get('content',{}).get('path', f'outputs/{out_name}')}"
-        st.success(f"Saved to GitHub: {gh_link}")
+        gh_link_md = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res.get('content',{}).get('path', f'outputs/{md_name}')}"
+        st.success(f"Saved Markdown to GitHub: {gh_link_md}")
     except Exception as e:
-        st.warning(f"Could not save to GitHub automatically: {e}")
+        st.warning(f"Could not save Markdown to GitHub automatically: {e}")
+
+    try:
+        if docx_bytes:
+            res2 = gh_put_file(f"outputs/{docx_name}", docx_bytes, f"Add manuscript {docx_name}")
+            owner, repo, branch = gh_repo_info()
+            link_branch = branch or "main"
+            gh_link_docx = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res2.get('content',{}).get('path', f'outputs/{docx_name}')}"
+            st.success(f"Saved Word to GitHub: {gh_link_docx}")
+    except Exception as e:
+        st.warning(f"Could not save Word to GitHub automatically: {e}")
