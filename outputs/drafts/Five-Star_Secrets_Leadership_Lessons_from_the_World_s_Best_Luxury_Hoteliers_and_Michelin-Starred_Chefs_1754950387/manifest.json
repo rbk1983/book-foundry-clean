@@ -81,9 +81,10 @@
   ],
   "completed": [
     1,
-    2
+    2,
+    3
   ],
-  "next_index": 2,
+  "next_index": 3,
   "urls_mode": "none",
   "use_tavily": false,
   "research_guidance": "",
