@@ -1,11 +1,10 @@
 
-import os, sys, time, math, hashlib, base64, json, re, datetime as dt
+import os, sys, time, math, hashlib, base64, json, re, datetime
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
 
-# ------------------ Page ------------------
-st.set_page_config(page_title="Book Auto-Generator (v3)", layout="wide")
+st.set_page_config(page_title="Book Auto-Generator (v4)", layout="wide")
 
 # ------------------ Diagnostics ------------------
 with st.sidebar:
@@ -100,18 +99,14 @@ def tavily_search(query: str,
                   exclude_domains: Optional[List[str]] = None,
                   search_depth: str = "advanced",
                   days: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Calls Tavily /search API. Returns list of dicts with keys: url, title, content, score (when available).
-    """
     api_key = _sec("TAVILY_API_KEY")
     if not api_key:
         return []
-
     payload = {
         "api_key": api_key,
         "query": query,
         "max_results": max_results,
-        "search_depth": search_depth,  # "basic" or "advanced"
+        "search_depth": search_depth,
         "include_answer": False,
         "include_raw_content": False,
         "source": "book-autogen"
@@ -122,7 +117,6 @@ def tavily_search(query: str,
         payload["exclude_domains"] = exclude_domains
     if days is not None:
         payload["days"] = days
-
     try:
         with httpx.Client(timeout=40.0) as c:
             r = c.post("https://api.tavily.com/search", json=payload)
@@ -144,8 +138,10 @@ def tavily_search(query: str,
 # ------------------ Text loaders & chunking ------------------
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-from docx.shared import Pt
+from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from markdown import markdown
 from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -218,9 +214,8 @@ with st.sidebar:
     st.header("Settings")
     st.text("OpenAI: ✅")
     st.write("Has GITHUB_TOKEN:", bool(_sec("GITHUB_TOKEN")))
-    owner, repo, branch = gh_repo_info()
-    st.write("Repo:", f"{owner}/{repo}" if owner and repo else "❌")
-    st.write("Branch:", branch or "(default)")
+    st.write("Repo:", f"{(_sec('GH_REPO_OWNER') or '?')}/{(_sec('GH_REPO_NAME') or '?')}")
+    st.write("Branch:", _sec("GH_BRANCH") or "(default)")
     st.write("Tavily key:", "✅" if _sec("TAVILY_API_KEY") else "—")
     st.divider()
     st.markdown("**Models**")
@@ -316,31 +311,26 @@ with col2:
 
 st.subheader("3) Outline & generation settings")
 outline_mode = st.radio("Outline source", ["Auto-generate", "I will paste an outline"], index=0, horizontal=True)
-num_chapters = st.number_input("Number of chapters (auto mode)", 8, 20, 12, 1)
-words_per_chapter = st.number_input("Target words per chapter", 1200, 8000, 3500, 100)
+num_chapters = st.number_input("Total chapters (including Introduction and Final Conclusion)", 8, 24, 12, 1)
+words_per_chapter = st.number_input("Target words per chapter", 1200, 12000, 3500, 100)
 
-st.markdown("**Web research** (optional)")
-use_web = st.checkbox("Enable manual web references (paste URLs below)", value=False)
-ref_urls = st.text_area("Reference URLs (one per line)", placeholder="https://example.com/report\nhttps://another.com/profile", height=100)
-urls_list = [u.strip() for u in ref_urls.splitlines() if u.strip()] if use_web else []
+st.markdown("**Web references (optional)**")
+use_web_urls = st.checkbox("Enable manual web links (paste below)", value=False)
+ref_urls = st.text_area("Reference URLs (one per line)", placeholder="https://example.com/report\nhttps://another.com/profile", height=100) if use_web_urls else ""
+urls_list = [u.strip() for u in ref_urls.splitlines() if u.strip()] if use_web_urls else []
 
-st.markdown("**Web research guidance (Tavily auto-search, optional)**")
+st.markdown("**Web research guidance (optional)**")
 research_guidance = st.text_area(
-    "Tell the system how to search and what to prioritize (e.g., peer‑reviewed since 2019, meta-analyses, add journal/DOI links, include leading industry reports).",
+    "Tell the system how to search and what to prioritize (e.g., peer‑reviewed studies since 2019; include hyperlinks to journals/DOIs; favor meta‑analyses).",
     height=120,
     placeholder="Prioritize recent peer‑reviewed research (2019+), systematic reviews, and meta‑analyses. Add inline links to journals or DOIs. Include major industry reports if relevant."
 )
-use_tavily = st.checkbox("Use Tavily web research automatically", value=True)
+use_tavily = st.checkbox("Use Tavily web research automatically", value=bool(_sec("TAVILY_API_KEY")))
 max_sources_per_chapter = st.slider("Max Tavily sources per chapter", 2, 12, 6, 1)
 prefer_academic = st.checkbox("Prefer academic/journal sources", value=True)
 recent_year_cutoff = st.number_input("Prefer sources published ≥ this year (0 to ignore)", min_value=0, max_value=2100, value=2019, step=1)
 include_domains_txt = st.text_input("Include only these domains (comma‑separated, optional)", value="")
 exclude_domains_txt = st.text_input("Exclude these domains (comma‑separated, optional)", value="")
-
-if outline_mode == "I will paste an outline":
-    pasted_outline = st.text_area("Paste your chapter list (one per line; optional synopsis after a dash):", height=160, placeholder="Chapter 1: Title — optional synopsis\nChapter 2: ...")
-else:
-    pasted_outline = ""
 
 st.divider()
 generate = st.button("🚀 One-Click: Generate Entire Book", type="primary")
@@ -352,17 +342,22 @@ You are a senior acquisitions editor. Propose a complete outline (chapters + bri
 Title: {book_title}
 Thesis: {thesis}
 Voice & Style: {style}
-Desired chapter count: {num_chapters}
+Desired total chapter count (including Introduction and Final Conclusion): {num_chapters}
+
+MANDATORY STRUCTURE
+- Chapter 1 MUST be titled "Introduction" (unambiguous).
+- The FINAL chapter MUST be titled "Final Conclusion" (unambiguous).
+- The chapters in between should build a coherent arc from premise → development → application.
 
 RULES
-- Use 10–14 chapters, coherent arc from premise → development → application → conclusion.
+- Provide exactly the requested total chapter count when feasible (10–14 typical).
 - Each chapter gets a short, actionable synopsis (2–4 sentences).
-- If context from my books is minimal or absent, rely on your general knowledge; fill gaps with sensible structure.
-- Output format:
-Chapter 1: Title — 2–4 sentence synopsis
-Chapter 2: Title — synopsis
+- Base structure primarily on my uploaded books if context is present; if minimal/absent, rely on general knowledge and your best judgment.
+- Output format EXACTLY:
+Chapter 1: Introduction — 2–4 sentence synopsis
+Chapter 2: <Title> — synopsis
 ...
-Chapter N: Title — synopsis
+Chapter N: Final Conclusion — synopsis
 
 Context excerpts (may be empty):
 {context}
@@ -371,7 +366,7 @@ Context excerpts (may be empty):
         {"role":"system","content":"You are an expert editor who creates commercially strong nonfiction outlines."},
         {"role":"user","content":prompt}
     ]
-    resp = client.chat.completions.create(model=st.session_state.model, temperature=0.4, messages=msgs, max_tokens=1800)
+    resp = client.chat.completions.create(model=st.session_state.model, temperature=0.35, messages=msgs, max_tokens=2000)
     return resp.choices[0].message.content
 
 def parse_outline(text: str) -> List[Dict[str,str]]:
@@ -395,6 +390,31 @@ def parse_outline(text: str) -> List[Dict[str,str]]:
         chapters.append({"num":num, "title":title, "synopsis":synopsis})
     return chapters
 
+def enforce_intro_final(chapters: List[Dict[str,str]], desired_count: int) -> List[Dict[str,str]]:
+    if not chapters:
+        return chapters
+    # Ensure first is Introduction
+    if chapters[0]["title"].strip().lower() != "introduction":
+        chapters.insert(0, {"num":"1","title":"Introduction","synopsis":"Sets the premise, audience promise, and roadmap."})
+    # Ensure last is Final Conclusion
+    if chapters[-1]["title"].strip().lower() not in ("final conclusion","conclusion","epilogue"):
+        chapters.append({"num":str(len(chapters)+1),"title":"Final Conclusion","synopsis":"Synthesize key ideas, implications, and next steps."})
+    # Adjust count
+    if desired_count > 0:
+        if len(chapters) > desired_count:
+            middle = chapters[1:-1]
+            slice_len = max(0, desired_count - 2)
+            middle = middle[:slice_len]
+            chapters = [chapters[0]] + middle + [chapters[-1]]
+        elif len(chapters) < desired_count:
+            needed = desired_count - len(chapters)
+            insert_pos = len(chapters)-1
+            for i in range(needed):
+                chapters.insert(insert_pos, {"num":"?","title":f"Bridge Chapter {i+1}","synopsis":"Bridges concepts to maintain narrative flow."})
+    for i,ch in enumerate(chapters, start=1):
+        ch["num"] = str(i)
+    return chapters
+
 def chapter_section_plan(ch_num: str, ch_title: str, ch_synopsis: str, target_words: int, sections: int, context: str) -> str:
     prompt = f"""
 Draft a section plan for Chapter {ch_num}: "{ch_title}" (~{target_words} words).
@@ -409,15 +429,15 @@ Context (may be empty):
         {"role":"system","content":"You are an expert nonfiction book outliner."},
         {"role":"user","content":prompt}
     ]
-    resp = client.chat.completions.create(model=st.session_state.model, temperature=0.4, messages=msgs, max_tokens=600)
+    resp = client.chat.completions.create(model=st.session_state.model, temperature=0.4, messages=msgs, max_tokens=650)
     return resp.choices[0].message.content
 
-def draft_section(si: int, sections_total: int, ch_num: str, ch_title: str, ch_synopsis: str, section_words: int, section_plan: str, context: str, urls: List[str], guidance: str, year_cutoff: int) -> str:
+def draft_section(si: int, sections_total: int, ch_num: str, ch_title: str, ch_synopsis: str, section_words: int, section_plan: str, context: str, urls: List[str], research_guidance: str, recent_year_cutoff: int) -> str:
     urls_block = "\n".join(f"- {u}" for u in urls) if urls else "(none)"
-    guidance_text = guidance.strip() if guidance else ""
+    guidance_text = research_guidance.strip() if research_guidance else ""
     recency_line = ""
-    if isinstance(year_cutoff, int) and year_cutoff > 0:
-        recency_line = f"Prefer sources published in {year_cutoff} or later when citing web material."
+    if isinstance(recent_year_cutoff, int) and recent_year_cutoff > 0:
+        recency_line = f"Prefer sources published in {recent_year_cutoff} or later when citing web material."
 
     prompt = f"""
 Write Section {si} (~{section_words} words) for Chapter {ch_num}: "{ch_title}".
@@ -462,7 +482,7 @@ CRITICAL RULES
 - Exactly ONE "## Conclusion" at the end. If earlier sections added any conclusion-like headings, merge their content into regular sections and remove the extra heading.
 - Preserve all inline attributions for verbatim quotes from my books:
   “quote” — Full Name, Role/Title at Hotel/Restaurant (Country)
-- Keep web hyperlinks where used; do not invent links; do not add citations to paraphrased book content. Preserve the exact URL text when merging.
+- Keep web hyperlinks where used; do not invent links; do not add citations to paraphrased book content. Preserve exact URL text when merging.
 
 Sections:
 {"\n\n---\n\n".join(sections)}
@@ -486,24 +506,66 @@ def dedup_boundary(old_text: str, new_text: str, lookback: int=120) -> str:
                 return newt[i:]
     return newt
 
-# ----------- Markdown → Docx (basic) -----------
-def add_hyperlink_text(para, text, url):
-    run = para.add_run(text)
-    run.font.underline = True
-    para.add_run(f" ({url})")
+# ----------- Markdown → Docx with TOC -----------
+def _add_hyperlink(paragraph, text, url, style=None):
+    # Proper hyperlink via relationship
+    part = paragraph.part
+    r_id = part.relate_to(url, reltype="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", is_external=True)
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+    new_run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+    u = OxmlElement('w:u'); u.set(qn('w:val'),'single')
+    rPr.append(u)
+    color = OxmlElement('w:color'); color.set(qn('w:val'), '0000FF')
+    rPr.append(color)
+    new_run.append(rPr)
+    t = OxmlElement('w:t'); t.text = text
+    new_run.append(t)
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
 
-def md_to_docx(md_text: str, title: str, thesis: str) -> bytes:
+def _add_field_simple(paragraph, instr_text: str, hint: str=""):
+    fld = OxmlElement('w:fldSimple')
+    fld.set(qn('w:instr'), instr_text)
+    r = OxmlElement('w:r'); t = OxmlElement('w:t'); t.text = hint or ""
+    r.append(t); fld.append(r)
+    paragraph._p.append(fld)
+
+def md_to_docx(md_text: str, title: str, thesis: str, author: str = "", date_str: str = "") -> bytes:
     doc = DocxDocument()
+
     # Title page
-    h = doc.add_heading(title, level=0)
-    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p = doc.add_paragraph("\n")
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    t = doc.add_paragraph(f"Thesis: {thesis}")
-    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    h = doc.add_heading(title, level=0); h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if author or date_str or thesis:
+        p = doc.add_paragraph("")
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if author:
+            p.add_run(author + "\n")
+        if date_str:
+            p.add_run(date_str + "\n")
+        if thesis:
+            p.add_run("\nThesis: " + thesis)
+
+    # Footer with page numbers: "Page X of Y"
+    section = doc.sections[0]
+    footer = section.footer
+    fp = footer.paragraphs[0]
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # PAGE field
+    _add_field_simple(fp, "PAGE", "Page ")
+    fp.add_run(" of ")
+    _add_field_simple(fp, "NUMPAGES", "N")
 
     doc.add_page_break()
 
+    # Table of Contents
+    doc.add_heading("Table of Contents", level=1)
+    p_toc = doc.add_paragraph()
+    _add_field_simple(p_toc, r'TOC \o "1-3" \h \z \u', "Right‑click and Update Field in Word to generate the TOC.")
+    doc.add_page_break()
+
+    # Body: simple Markdown mapping
     lines = md_text.replace("\r","\n").split("\n")
     for line in lines:
         if line.startswith("# "):
@@ -514,20 +576,19 @@ def md_to_docx(md_text: str, title: str, thesis: str) -> bytes:
             doc.add_heading(line[4:].strip(), level=3)
         else:
             para = doc.add_paragraph()
-            pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
             last = 0
+            pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
             for m in pattern.finditer(line):
                 before = line[last:m.start()]
                 if before:
                     para.add_run(before)
-                text = m.group(1)
-                url = m.group(2)
-                add_hyperlink_text(para, text, url)
+                _add_hyperlink(para, m.group(1), m.group(2))
                 last = m.end()
             tail = line[last:]
             if tail:
                 para.add_run(tail)
-    tmp = f"/mnt/data/_tmp_{int(time.time())}.docx"
+
+    tmp = f"/mnt/data/_book_{int(time.time())}.docx"
     doc.save(tmp)
     with open(tmp, "rb") as f:
         return f.read()
@@ -545,12 +606,14 @@ if generate:
         st.markdown("#### Proposed Outline")
         st.code(outline_text)
     else:
-        outline_text = pasted_outline
+        outline_text = st.text_area("Paste your chapter list (one per line; optional synopsis after a dash):", height=160, placeholder="Chapter 1: Introduction — ...\nChapter 2: ...\nChapter N: Final Conclusion — ...")
+        if not outline_text.strip():
+            st.stop()
         st.markdown("#### Using your pasted outline")
         st.code(outline_text)
 
-    # Parse outline
     chapters = parse_outline(outline_text)
+    chapters = enforce_intro_final(chapters, int(num_chapters))
     if not chapters:
         st.error("Could not parse any chapters from the outline. Make sure lines start with 'Chapter N:'")
         st.stop()
@@ -569,9 +632,8 @@ if generate:
         hits = retrieve(query, k=top_k, tags=None) if records else []
         ctx = make_context(hits)
 
-        # ----- Chapter-specific web sources -----
+        # Tavily sources for this chapter
         manual_urls = urls_list[:] if urls_list else []
-
         tavily_urls = []
         if use_tavily and _sec("TAVILY_API_KEY"):
             rq_parts = [
@@ -588,8 +650,8 @@ if generate:
 
             days_window = None
             if isinstance(recent_year_cutoff, int) and recent_year_cutoff > 0:
-                start = dt.datetime(recent_year_cutoff, 1, 1)
-                days_window = max(1, (dt.datetime.utcnow() - start).days)
+                start = datetime.datetime(recent_year_cutoff, 1, 1)
+                days_window = max(1, (datetime.datetime.utcnow() - start).days)
 
             raw = tavily_search(
                 query=research_query,
@@ -599,18 +661,16 @@ if generate:
                 search_depth="advanced",
                 days=days_window
             )
-
-            if prefer_academic and raw:
+            if raw:
                 def is_academic(u: str) -> bool:
                     u = (u or "").lower()
                     return any(x in u for x in [".edu", ".ac.", "nature.com", "science.org", "sciencedirect.com", "jstor.org", "springer", "wiley.com", "tandfonline.com", "cell.com", "nejm.org", "thelancet.com", "doi.org"])
-                raw_sorted = sorted(raw, key=lambda r: (not is_academic(r.get("url","")), -float(r.get("score",0.0))))
-            else:
-                raw_sorted = sorted(raw, key=lambda r: -float(r.get("score",0.0)))
+                if prefer_academic:
+                    raw_sorted = sorted(raw, key=lambda r: (not is_academic(r.get("url","")), -float(r.get("score",0.0))))
+                else:
+                    raw_sorted = sorted(raw, key=lambda r: -float(r.get("score",0.0)))
+                tavily_urls = [r["url"] for r in raw_sorted if r.get("url")]
 
-            tavily_urls = [r["url"] for r in raw_sorted if r.get("url")]
-
-        # Merge and dedupe URLs
         effective_urls = []
         seen = set()
         for u in (manual_urls + tavily_urls):
@@ -626,7 +686,7 @@ if generate:
         sec_texts = []
         per_sec = max(450, min(900, int(words_per_chapter/sections_target)))
         for si in range(1, sections_target+1):
-            s_txt = draft_section(si, sections_target, ch_num, ch_title, ch_syn, per_sec, plan_text, ctx, effective_urls, research_guidance, recent_year_cutoff)
+            s_txt = draft_section(si, sections_target, ch_num, ch_title, ch_syn, per_sec, plan_text, ctx, effective_urls, research_guidance, int(recent_year_cutoff))
             if sec_texts:
                 s_txt = dedup_boundary(sec_texts[-1], s_txt, lookback=160)
             sec_texts.append(s_txt)
@@ -662,13 +722,15 @@ Aim for ~{per_sec}–{per_sec+200} words. Current ending:
     md_name = f"{safe_title}_{ts}.md"
     docx_name = f"{safe_title}_{ts}.docx"
 
-    # Download buttons
+    # Downloads
     st.download_button("⬇️ Download manuscript (Markdown)", manuscript, file_name=md_name)
 
-    # Build a .docx version
+    # Build a .docx version with TOC
     try:
-        docx_bytes = md_to_docx(manuscript, book_title, thesis)
-        st.download_button("⬇️ Download manuscript (Word .docx)", docx_bytes, file_name=docx_name)
+        today = datetime.datetime.now().strftime("%B %d, %Y")
+        author = _sec("BOOK_AUTHOR") or ""
+        docx_bytes = md_to_docx(manuscript, book_title, thesis, author=author, date_str=today)
+        st.download_button("⬇️ Download manuscript (Word .docx with TOC)", docx_bytes, file_name=docx_name)
     except Exception as e:
         st.warning(f"Could not generate .docx: {e}")
         docx_bytes = None
@@ -676,19 +738,13 @@ Aim for ~{per_sec}–{per_sec+200} words. Current ending:
     # GitHub save
     try:
         res = gh_put_file(f"outputs/{md_name}", manuscript.encode("utf-8"), f"Add manuscript {md_name}")
-        owner, repo, branch = gh_repo_info()
-        link_branch = branch or "main"
-        gh_link_md = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res.get('content',{}).get('path', f'outputs/{md_name}')}"
-        st.success(f"Saved Markdown to GitHub: {gh_link_md}")
+        st.success("Saved Markdown to GitHub.")
     except Exception as e:
         st.warning(f"Could not save Markdown to GitHub automatically: {e}")
 
     try:
         if docx_bytes:
-            res2 = gh_put_file(f"outputs/{docx_name}", docx_bytes, f"Add manuscript {docx_name}")
-            owner, repo, branch = gh_repo_info()
-            link_branch = branch or "main"
-            gh_link_docx = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res2.get('content',{}).get('path', f'outputs/{docx_name}')}"
-            st.success(f"Saved Word to GitHub: {gh_link_docx}")
+            gh_put_file(f"outputs/{docx_name}", docx_bytes, f"Add manuscript {docx_name}")
+            st.success("Saved Word to GitHub.")
     except Exception as e:
         st.warning(f"Could not save Word to GitHub automatically: {e}")
