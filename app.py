@@ -954,6 +954,7 @@ if generate:
 if resume:
    # ---------- Post-Process Manuscript ----------
 st.divider()
+st.info("🔧 Post-process panel loaded")
 st.subheader("4) Post-process manuscript (cleanup + quotes + diff)")
 
 st.markdown(
