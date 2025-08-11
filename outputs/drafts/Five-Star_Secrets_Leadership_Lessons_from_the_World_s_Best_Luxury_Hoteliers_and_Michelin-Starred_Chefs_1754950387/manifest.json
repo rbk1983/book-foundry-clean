@@ -90,9 +90,10 @@
     8,
     9,
     10,
-    11
+    11,
+    12
   ],
-  "next_index": 11,
+  "next_index": 12,
   "urls_mode": "none",
   "use_tavily": false,
   "research_guidance": "",
