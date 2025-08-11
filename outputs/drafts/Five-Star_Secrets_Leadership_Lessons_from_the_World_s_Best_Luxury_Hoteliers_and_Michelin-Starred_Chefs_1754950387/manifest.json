@@ -80,9 +80,10 @@
     }
   ],
   "completed": [
-    1
+    1,
+    2
   ],
-  "next_index": 1,
+  "next_index": 2,
   "urls_mode": "none",
   "use_tavily": false,
   "research_guidance": "",
