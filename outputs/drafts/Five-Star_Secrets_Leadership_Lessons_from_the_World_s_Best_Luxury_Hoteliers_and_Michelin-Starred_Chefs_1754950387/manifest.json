@@ -83,9 +83,10 @@
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
-  "next_index": 4,
+  "next_index": 5,
   "urls_mode": "none",
   "use_tavily": false,
   "research_guidance": "",
