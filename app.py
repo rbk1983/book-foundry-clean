@@ -360,6 +360,7 @@ with tab_sources:
     st.markdown("#### Restore from GitHub storage")
     if st.button("Load all files from GitHub"):
         try:
+            os.makedirs("data", exist_ok=True)
             items = gh_list_dir("uploads")
             if not items:
                 st.info("No files in GitHub /uploads yet.")
