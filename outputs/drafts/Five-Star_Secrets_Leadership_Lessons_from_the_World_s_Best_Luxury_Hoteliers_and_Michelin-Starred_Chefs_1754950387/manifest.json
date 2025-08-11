@@ -79,8 +79,10 @@
       "sections": []
     }
   ],
-  "completed": [],
-  "next_index": 0,
+  "completed": [
+    1
+  ],
+  "next_index": 1,
   "urls_mode": "none",
   "use_tavily": false,
   "research_guidance": "",
