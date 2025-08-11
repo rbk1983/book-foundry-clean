@@ -751,7 +751,7 @@ Context notes:
                         {"role":"user","content":sec_prompt}
                     ]
                     sec_resp = client.chat.completions.create(
-                        model=chat_model, temperature=0.6, messages=msgs, max_tokens=1200
+                        model=chat_model, temperature=0.6, messages=msgs, max_tokens=1500
                     )
                     assembled.append(sec_resp.choices[0].message.content)
 
@@ -775,6 +775,47 @@ Sections:
                 ch_state["status"] = "draft"
                 st.success("Draft created (longform).")
                 st.markdown(ch_state["draft"])
+                # Auto-continue if under target (up to 2 passes)
+                def _word_count(txt): 
+                    return len((txt or "").split())
+                try:
+                    passes = 0
+                    while _word_count(ch_state["draft"]) < int(target_words * 0.95) and passes < 2:
+                        cont_prompt = f"""Continue the chapter seamlessly from where it stops. 
+Do NOT repeat previous text. Add substantial new content that fits the existing structure and voice.
+Maintain headings; add 2–3 new subsections if appropriate. Aim for ~{int(target_words/sections_target)}–{int(target_words/sections_target)+200} words.
+Current chapter ends with:
+{ch_state['draft'][-800:]}"""
+                        msgs = [
+                            {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
+                            {"role":"user","content":cont_prompt}
+                        ]
+                        c_resp = client.chat.completions.create(model=chat_model, temperature=0.6, messages=msgs, max_tokens=1500)
+                        ch_state["draft"] += "\n\n" + c_resp.choices[0].message.content
+                        passes += 1
+                except Exception as _e:
+                    pass
+
+                st.markdown(ch_state["draft"])
+
+                st.info("If the draft still ends abruptly, click 'Continue chapter' below to extend it without repetition.")
+                if st.button("Continue chapter"):
+                    cont_prompt2 = f"""Continue the chapter seamlessly from where it stops.
+Do NOT repeat prior sentences. Keep voice and structure; ensure a clear closing that tees up the next chapter.
+Current chapter ends with:
+{ch_state['draft'][-1000:]}"""
+                    msgs = [
+                        {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
+                        {"role":"user","content":cont_prompt2}
+                    ]
+                    try:
+                        c2_resp = client.chat.completions.create(model=chat_model, temperature=0.6, messages=msgs, max_tokens=1600)
+                        ch_state["draft"] += "\n\n" + c2_resp.choices[0].message.content
+                        st.success("Extended.")
+                        st.markdown(ch_state["draft"])
+                    except Exception as e:
+                        st.error(f"Continuation failed: {e}")
+
             except Exception as e:
                 st.error(f"Longform drafting failed: {e}")
 
@@ -808,6 +849,47 @@ Write a cohesive chapter in Markdown with:
                 ch_state["status"] = "draft"
                 st.success("Draft created.")
                 st.markdown(ch_state["draft"])
+                # Auto-continue if under target (up to 2 passes)
+                def _word_count(txt): 
+                    return len((txt or "").split())
+                try:
+                    passes = 0
+                    while _word_count(ch_state["draft"]) < int(target_words * 0.95) and passes < 2:
+                        cont_prompt = f"""Continue the chapter seamlessly from where it stops. 
+Do NOT repeat previous text. Add substantial new content that fits the existing structure and voice.
+Maintain headings; add 2–3 new subsections if appropriate. Aim for ~{int(target_words/sections_target)}–{int(target_words/sections_target)+200} words.
+Current chapter ends with:
+{ch_state['draft'][-800:]}"""
+                        msgs = [
+                            {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
+                            {"role":"user","content":cont_prompt}
+                        ]
+                        c_resp = client.chat.completions.create(model=chat_model, temperature=0.6, messages=msgs, max_tokens=1500)
+                        ch_state["draft"] += "\n\n" + c_resp.choices[0].message.content
+                        passes += 1
+                except Exception as _e:
+                    pass
+
+                st.markdown(ch_state["draft"])
+
+                st.info("If the draft still ends abruptly, click 'Continue chapter' below to extend it without repetition.")
+                if st.button("Continue chapter"):
+                    cont_prompt2 = f"""Continue the chapter seamlessly from where it stops.
+Do NOT repeat prior sentences. Keep voice and structure; ensure a clear closing that tees up the next chapter.
+Current chapter ends with:
+{ch_state['draft'][-1000:]}"""
+                    msgs = [
+                        {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
+                        {"role":"user","content":cont_prompt2}
+                    ]
+                    try:
+                        c2_resp = client.chat.completions.create(model=chat_model, temperature=0.6, messages=msgs, max_tokens=1600)
+                        ch_state["draft"] += "\n\n" + c2_resp.choices[0].message.content
+                        st.success("Extended.")
+                        st.markdown(ch_state["draft"])
+                    except Exception as e:
+                        st.error(f"Continuation failed: {e}")
+
             except Exception as e:
                 st.error(f"Drafting failed: {e}")
 
@@ -825,6 +907,47 @@ Write a cohesive chapter in Markdown with:
                 ch_state["status"] = "revised"
                 st.success("Revised.")
                 st.markdown(ch_state["draft"])
+                # Auto-continue if under target (up to 2 passes)
+                def _word_count(txt): 
+                    return len((txt or "").split())
+                try:
+                    passes = 0
+                    while _word_count(ch_state["draft"]) < int(target_words * 0.95) and passes < 2:
+                        cont_prompt = f"""Continue the chapter seamlessly from where it stops. 
+Do NOT repeat previous text. Add substantial new content that fits the existing structure and voice.
+Maintain headings; add 2–3 new subsections if appropriate. Aim for ~{int(target_words/sections_target)}–{int(target_words/sections_target)+200} words.
+Current chapter ends with:
+{ch_state['draft'][-800:]}"""
+                        msgs = [
+                            {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
+                            {"role":"user","content":cont_prompt}
+                        ]
+                        c_resp = client.chat.completions.create(model=chat_model, temperature=0.6, messages=msgs, max_tokens=1500)
+                        ch_state["draft"] += "\n\n" + c_resp.choices[0].message.content
+                        passes += 1
+                except Exception as _e:
+                    pass
+
+                st.markdown(ch_state["draft"])
+
+                st.info("If the draft still ends abruptly, click 'Continue chapter' below to extend it without repetition.")
+                if st.button("Continue chapter"):
+                    cont_prompt2 = f"""Continue the chapter seamlessly from where it stops.
+Do NOT repeat prior sentences. Keep voice and structure; ensure a clear closing that tees up the next chapter.
+Current chapter ends with:
+{ch_state['draft'][-1000:]}"""
+                    msgs = [
+                        {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
+                        {"role":"user","content":cont_prompt2}
+                    ]
+                    try:
+                        c2_resp = client.chat.completions.create(model=chat_model, temperature=0.6, messages=msgs, max_tokens=1600)
+                        ch_state["draft"] += "\n\n" + c2_resp.choices[0].message.content
+                        st.success("Extended.")
+                        st.markdown(ch_state["draft"])
+                    except Exception as e:
+                        st.error(f"Continuation failed: {e}")
+
             except Exception as e:
                 st.error(f"Revision failed: {e}")
 
