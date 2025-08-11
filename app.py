@@ -1,24 +1,5 @@
-# app.py
-# Rahim's AI Book Studio — Streamlit app
-# - Upload/ingest sources (PDF/DOCX/MD/TXT) with GitHub persistence
-# - Auto-detect "master outline" and generate a strict source-mapping that mirrors it 1:1
-# - Draft chapters with retrieval from your corpus and inline source markers
-# - Export a Markdown manuscript
-#
-# Required Secrets (Settings → Secrets):
-#   OPENAI_API_KEY = "sk-..."
-#   GITHUB_TOKEN   = "ghp_... or github_pat_..."
-#   GH_REPO_OWNER  = "rbk1983"
-#   GH_REPO_NAME   = "book-foundry-clean"   # your storage repo
-#   GH_BRANCH      = ""                      # optional; leave blank to use default
-#
-# Notes:
-# - "Load all files from GitHub" pulls everything in /uploads into /data and re-ingests.
-# - Name your master outline file so it contains BOTH words: "outline" and "master",
-#   e.g., "BookOutline_MASTER.docx" or "outline_MASTER.txt".
-#   Then: Sources → Load all files from GitHub → Outline tab should show the detected file.
 
-import os, sys, time, math, hashlib, base64, json
+import os, sys, time, math, hashlib, base64, json, re
 from typing import List, Dict, Any
 
 import streamlit as st
@@ -41,12 +22,11 @@ try:
 except Exception as e:
     st.sidebar.write("httpx import error:", e)
 
-# Ensure working data directory exists for temp files
+# Ensure working data directory exists
 os.makedirs("data", exist_ok=True)
 
 # ==================== Secrets helper ====================
 def _sec(name: str):
-    """Safe access for Streamlit secrets/env (no .get on st.secrets)."""
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -54,7 +34,7 @@ def _sec(name: str):
         pass
     return os.getenv(name)
 
-# ==================== OpenAI client (safe init) ====================
+# ==================== OpenAI client ====================
 from openai import OpenAI
 
 OPENAI_KEY = _sec("OPENAI_API_KEY")
@@ -65,7 +45,7 @@ if not OPENAI_KEY:
 
 client = OpenAI(api_key=OPENAI_KEY)
 
-# ==================== GitHub helpers (persistence) ====================
+# ==================== GitHub helpers ====================
 import httpx
 
 def gh_headers():
@@ -79,11 +59,10 @@ def gh_headers():
 def gh_repo_info():
     owner  = _sec("GH_REPO_OWNER")
     repo   = _sec("GH_REPO_NAME")
-    branch = _sec("GH_BRANCH")  # may be None/empty -> use repo default
+    branch = _sec("GH_BRANCH")
     return owner, repo, branch
 
 def gh_put_file(path_rel: str, content_bytes: bytes, message: str) -> dict:
-    """Create/update a file in repo at path_rel. Returns GitHub response JSON."""
     owner, repo, branch = gh_repo_info()
     if not (owner and repo):
         raise RuntimeError("GH_REPO_OWNER or GH_REPO_NAME missing in Secrets.")
@@ -177,11 +156,9 @@ def chunk_text(text: str, chunk_size=1200, overlap=200) -> List[str]:
         separators=["\n\n", "\n", ". ", "? ", "! ", " ", ""]
     )
     pieces = [t.strip() for t in splitter.split_text(text)]
-    # Drop truly empty chunks
     return [p for p in pieces if p]
 
 def embed_texts(texts: List[str], model: str) -> List[List[float]]:
-    # Guard: never call embeddings API with empty input
     texts = [t for t in texts if t and t.strip()]
     if not texts:
         return []
@@ -201,17 +178,80 @@ def cosine_sim(a: List[float], b: List[float]) -> float:
 def sha16(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
+# ==================== Mapping parser (for prefill helper) ====================
+def load_mapping_files_from_data():
+    files = []
+    if os.path.exists("data"):
+        for fname in os.listdir("data"):
+            if fname.lower().startswith("mapping_") and fname.lower().endswith(".md"):
+                files.append((fname, os.path.join("data", fname)))
+    return sorted(files)
+
+def parse_mapping_markdown(md_text: str):
+    chapters = []
+    current_ch = None
+    current_sc = None
+
+    lines = md_text.replace("\r\n","\n").replace("\r","\n").split("\n")
+    h1 = re.compile(r"^#\s*Chapter\s+(\d+)\s*:\s*(.+)\s*$", re.IGNORECASE)
+    h2 = re.compile(r"^##\s*Subchapter\s+([\d\.]+)\s*:\s*(.+)\s*$", re.IGNORECASE)
+
+    for raw in lines:
+        line = raw.strip()
+
+        m = h1.match(line)
+        if m:
+            current_ch = {
+                "num": m.group(1),
+                "title": m.group(2).strip(),
+                "subchapters": [],
+                "bullets": []
+            }
+            chapters.append(current_ch)
+            current_sc = None
+            continue
+
+        m = h2.match(line)
+        if m and current_ch:
+            current_sc = {
+                "num": m.group(1),
+                "title": m.group(2).strip(),
+                "bullets": []
+            }
+            current_ch["subchapters"].append(current_sc)
+            continue
+
+        if line.startswith("-") and (current_ch is not None):
+            m1 = re.match(r"^\s*-\s*\[Source:\s*([^\]]+)\]\s*(.*)$", line)
+            src=None; excerpt=None; why=None
+            if m1:
+                src = m1.group(1).strip()
+                tail = m1.group(2).strip()
+                m2 = re.search(r"“([^”]+)”", tail) or re.search(r"\"([^\"]+)\"", tail)
+                if m2:
+                    excerpt = m2.group(1).strip()
+                m3 = re.search(r"—\s*(.+)$", tail) or re.search(r"-\s*(.+)$", tail)
+                if m3:
+                    why = m3.group(1).strip()
+            entry = {"source": src, "excerpt": excerpt, "why": why}
+            if current_sc is not None:
+                current_sc["bullets"].append(entry)
+            else:
+                current_ch["bullets"].append(entry)
+
+    return {"chapters": chapters}
+
 # ==================== Session state ====================
 if "plan" not in st.session_state:
     st.session_state.plan = {
         "title": "My Third Book",
         "thesis": "",
         "style": "",
-        "chapters": {}  # "1": {"title": "...", "synopsis": "...", "draft": "...", "status": "..."}
+        "chapters": {}
     }
 
 if "corpus" not in st.session_state:
-    st.session_state.corpus = []  # list of {id,text,tags,source,emb}
+    st.session_state.corpus = []
 
 plan = st.session_state.plan
 corpus: List[Dict[str, Any]] = st.session_state.corpus
@@ -286,14 +326,19 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Write failed (generic): {e}")
 
+    st.divider()
+    st.markdown("### ✍️ Longform drafting")
+    longform = st.checkbox("Longform mode (section-by-section)", value=True)
+    sections_target = st.slider("Sections to draft", 3, 10, 6, 1)
+    section_words = st.slider("Words per section (~)", 400, 900, 600, 50)
+
 # ==================== Tabs ====================
 tab_sources, tab_outline, tab_draft, tab_export = st.tabs(
     ["📥 Sources", "🧭 Outline", "✍️ Draft", "📤 Export"]
 )
 
-# ==================== Utility to add records safely ====================
+# ==================== Utility to add records ====================
 def add_records(texts: List[str], tags: List[str], source: str, model: str, added_counter: Dict[str, int] = None):
-    # Filter empty strings before embedding
     clean_texts = [t for t in texts if t and t.strip()]
     if not clean_texts:
         return 0
@@ -346,7 +391,6 @@ with tab_sources:
                         st.error(f"GitHub upload failed for {f.name}: {e}")
                         continue
 
-                # Save to temp then parse
                 tmp = os.path.join("data", f"{int(time.time())}_{f.name}")
                 with open(tmp, "wb") as out:
                     out.write(raw_bytes)
@@ -376,7 +420,7 @@ with tab_sources:
     st.markdown("#### Restore from GitHub storage")
     if st.button("Load all files from GitHub"):
         try:
-            os.makedirs("data", exist_ok=True)  # ensure folder exists
+            os.makedirs("data", exist_ok=True)
             items = gh_list_dir("uploads")
             if not items:
                 st.info("No files in GitHub /uploads yet.")
@@ -409,7 +453,7 @@ with tab_outline:
     with c2:
         plan["style"] = st.text_area("Style sheet (voice, tense, pacing, terminology)", value=plan["style"], height=140)
 
-    # Auto-detect master outline file in local /data (restored from GitHub)
+    # Auto-detect master outline file in local /data
     outline_file = None
     if os.path.exists("data"):
         for fname in os.listdir("data"):
@@ -429,7 +473,7 @@ with tab_outline:
             {"role":"user","content":f"Plan a new 250–300 page book.\nTitle: {plan['title']}\n\nThesis:\n{plan['thesis']}\n\nUse only my uploaded corpus as background.\nConstraints: 10–14 chapters, coherent arc.\nProduce: 3 title options, detailed TOC, 3–6 subtopics per chapter, 2–4 sentence synopsis per chapter, and a brief style sheet."}
         ]
         try:
-            resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
+            resp = client.chat.completions.create(model=chat_model, temperature=0.5, messages=msgs, max_tokens=1800)
             st.markdown(resp.choices[0].message.content)
             st.info("Copy/paste chapter titles & synopses into the Draft tab.")
         except Exception as e:
@@ -446,7 +490,7 @@ with tab_outline:
 
     if st.button("Generate source mapping (lock to master outline)"):
         if not st.session_state.get("outline_file_path"):
-            st.error("No master outline detected. See note above and load your outline into /data first (Sources tab → Load all files from GitHub).")
+            st.error("No master outline detected. Load your outline into /data first (Sources → Load all files from GitHub).")
         else:
             thesis_mission = plan["thesis"] or "Create a unified, updated narrative based on my two books; maintain my voice and structure."
             outline_path = st.session_state["outline_file_path"]
@@ -496,14 +540,14 @@ STYLE / VOICE GUIDANCE:
             try:
                 resp = client.chat.completions.create(
                     model=chat_model,
-                    temperature=0.2,  # low temp for strict adherence
-                    messages=msgs
+                    temperature=0.2,
+                    messages=msgs,
+                    max_tokens=2800
                 )
                 mapping_md = resp.choices[0].message.content
                 st.success("Source mapping created (mirrors master outline).")
                 st.markdown(mapping_md)
 
-                # Optional: save mapping to GitHub
                 if do_save_mapping:
                     try:
                         fname = mapping_filename.strip() or f"mapping_{int(time.time())}.md"
@@ -520,7 +564,7 @@ STYLE / VOICE GUIDANCE:
             except Exception as e:
                 st.error(f"Source mapping failed: {e}")
 
-# ==================== Retrieval (in-memory) ====================
+# ==================== Retrieval ====================
 def retrieve(query: str, k: int, tag_filter_text: str) -> List[Dict[str, Any]]:
     if not corpus:
         return []
@@ -553,7 +597,76 @@ def make_context(hits: List[Dict[str, Any]]) -> str:
 # ==================== DRAFT ====================
 with tab_draft:
     st.subheader("Draft a chapter")
-    # Chapter tracker UI
+
+    # -------- Mapping → Prefill helper --------
+    with st.expander("📚 Use mapping to prefill chapter fields", expanded=False):
+        st.caption("Pick a saved mapping_*.md from /data, then choose a chapter (and optional subchapter). We’ll prefill chapter #, title, and a retrieval-ready query hint.")
+
+        mapping_files = load_mapping_files_from_data()
+        if not mapping_files:
+            st.info("No mapping files found in /data. In the Outline tab, generate a source mapping (and keep 'save mapping to GitHub' checked), then go to Sources → Load all files from GitHub.")
+        else:
+            mlabel = [f"{i+1}. {fname}" for i,(fname,_) in enumerate(mapping_files)]
+            idx = st.selectbox("Choose a mapping file", list(range(len(mapping_files))), format_func=lambda i: mlabel[i])
+            chosen_name, chosen_path = mapping_files[idx]
+            try:
+                mtext = open(chosen_path, "r", encoding="utf-8", errors="ignore").read()
+                parsed = parse_mapping_markdown(mtext)
+                chapters_list = parsed["chapters"]
+                if not chapters_list:
+                    st.warning("Could not find any '# Chapter N: Title' headings in this mapping.")
+                else:
+                    ch_labels = [f"{c['num']}: {c['title']}" for c in chapters_list]
+                    ch_idx = st.selectbox("Chapter", list(range(len(chapters_list))), format_func=lambda i: ch_labels[i])
+                    selected_ch = chapters_list[ch_idx]
+
+                    sc_labels = ["(None — use chapter level)"] + [f"{sc['num']}: {sc['title']}" for sc in selected_ch.get("subchapters", [])]
+                    sc_idx = st.selectbox("Subchapter (optional)", list(range(len(sc_labels))), format_func=lambda i: sc_labels[i])
+                    selected_sc = None if sc_idx == 0 else selected_ch["subchapters"][sc_idx-1]
+
+                    bullets = (selected_sc["bullets"] if selected_sc else selected_ch.get("bullets", [])) or []
+                    anchors = []
+                    src_set = set()
+                    for b in bullets[:10]:
+                        if b.get("source"):
+                            src_set.add(b["source"])
+                        if b.get("excerpt"):
+                            anchors.append(b["excerpt"])
+                    src_hint = ", ".join(sorted(src_set))
+                    ex_hint = "; ".join(anchors)
+
+                    suggested_query = f"Chapter {selected_ch['num']}: {selected_ch['title']}"
+                    if selected_sc:
+                        suggested_query += f" — Subchapter {selected_sc['num']}: {selected_sc['title']}"
+                    if src_hint:
+                        suggested_query += f" | Sources: {src_hint}"
+                    if ex_hint:
+                        suggested_query += f" | Anchors: {ex_hint}"
+
+                    st.text_area("Preview of retrieval hint", value=suggested_query, height=100, key="mapping_preview_hint")
+
+                    if st.button("Prefill Draft fields from mapping"):
+                        st.session_state.setdefault("plan", {}).setdefault("chapters", {})
+                        ch_number = selected_ch["num"]
+                        st.session_state["plan"]["chapters"].setdefault(ch_number, {"title":"", "synopsis":"", "draft":"", "status":"draft"})
+                        ch_state_mut = st.session_state["plan"]["chapters"][ch_number]
+
+                        prefill_title = selected_sc["title"] if selected_sc else selected_ch["title"]
+                        ch_state_mut["title"] = prefill_title
+                        if anchors:
+                            ch_state_mut["synopsis"] = (ch_state_mut.get("synopsis") or f"This section builds on: {', '.join(anchors[:5])}.")
+                        else:
+                            ch_state_mut["synopsis"] = ch_state_mut.get("synopsis") or ""
+
+                        st.session_state["__prefill_query_hint__"] = st.session_state.get("mapping_preview_hint","")
+                        st.session_state["__prefill_ch_number__"] = ch_number
+
+                        st.success(f"Prefilled Chapter {ch_number} — {prefill_title}. Scroll to the editor; fields will be set.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Could not read or parse mapping: {e}")
+
+    # -------- Chapter tracker UI --------
     st.markdown("**Chapter tracker**")
     if plan["chapters"]:
         for k in sorted(plan["chapters"].keys(), key=lambda x: int(x) if x.isdigit() else x):
@@ -562,21 +675,111 @@ with tab_draft:
     else:
         st.info("No chapters yet — add one below.")
 
-    # Editor
-    current_keys = list(plan["chapters"].keys())
-    default_ch = current_keys[0] if current_keys else "1"
+    # -------- Editor --------
+    if "__prefill_ch_number__" in st.session_state:
+        default_ch = st.session_state["__prefill_ch_number__"]
+        del st.session_state["__prefill_ch_number__"]
+    else:
+        current_keys = list(plan["chapters"].keys())
+        default_ch = current_keys[0] if current_keys else "1"
+
     ch_num = st.text_input("Chapter number", value=default_ch)
     ch_state = plan["chapters"].setdefault(ch_num, {"title":"", "synopsis":"", "draft":"", "status":"draft"})
     ch_state["title"] = st.text_input("Chapter title", value=ch_state["title"])
     ch_state["synopsis"] = st.text_area("Chapter synopsis", value=ch_state["synopsis"], height=140)
     target_words = st.number_input("Target words", 800, 8000, 3500, 100)
-    query_hint = st.text_input("Optional retrieval hint (keywords)")
 
+    if "__prefill_query_hint__" in st.session_state:
+        prefill_q = st.session_state["__prefill_query_hint__"]
+        del st.session_state["__prefill_query_hint__"]
+        query_hint = st.text_input("Optional retrieval hint (keywords)", value=prefill_q)
+    else:
+        query_hint = st.text_input("Optional retrieval hint (keywords)")
+
+    # -------- Draft button --------
     if st.button("Retrieve & Draft", type="primary"):
         q = query_hint or f"{plan['title']} - {ch_state['title']} - {ch_state['synopsis']}"
         hits = retrieve(q, top_k, tag_filter)
         context = make_context(hits)
-        prompt = f"""
+
+        if longform:
+            # Plan sections
+            plan_prompt = f"""
+You will draft a long chapter in {sections_target} sections to reach ~{target_words} words.
+Topic: Chapter {ch_num}: "{ch_state['title']}"
+Book: "{plan['title']}"
+Style: {plan['style']}
+Synopsis: {ch_state['synopsis']}
+Thesis: {plan['thesis']}
+
+First, produce ONLY a numbered section plan with {sections_target} short, specific section titles (1–2 lines each) covering the full scope. Avoid overlap. Do not write the prose yet.
+Context notes (may quote/attribute as [S1], [S2], etc. later):
+{context}
+""".strip()
+
+            msgs = [
+                {"role":"system","content":"You are an expert long-form writing assistant."},
+                {"role":"user","content":plan_prompt}
+            ]
+            try:
+                plan_resp = client.chat.completions.create(
+                    model=chat_model, temperature=0.4, messages=msgs, max_tokens=1200
+                )
+                section_plan = plan_resp.choices[0].message.content
+                st.markdown("### Section plan")
+                st.markdown(section_plan)
+
+                # Loop sections
+                assembled = []
+                for si in range(1, sections_target+1):
+                    sec_prompt = f"""
+Draft Section {si} (~{section_words} words) for Chapter {ch_num}: "{ch_state['title']}".
+Follow this approved section plan:
+{section_plan}
+
+Constraints:
+- Write ONLY Section {si}. Do not draft other sections.
+- Maintain voice and pacing. Avoid repetition with prior sections.
+- Use context notes below; paraphrase and attribute facts as [S1], [S2], etc. where appropriate.
+- End Section {si} with a line that naturally sets up the next section.
+
+Context notes:
+{context}
+""".strip()
+                    msgs = [
+                        {"role":"system","content":"You are an expert long-form writing assistant. Reply in Markdown."},
+                        {"role":"user","content":sec_prompt}
+                    ]
+                    sec_resp = client.chat.completions.create(
+                        model=chat_model, temperature=0.6, messages=msgs, max_tokens=1200
+                    )
+                    assembled.append(sec_resp.choices[0].message.content)
+
+                # Stitch + polish
+                stitch_prompt = f"""
+Combine the sections below into a cohesive chapter (~{target_words} words).
+Keep the existing text; smooth transitions; remove duplicates; consistent headings (## / ###).
+Open with a strong hook and close with a forward-looking ending to tee up the next chapter.
+
+Sections:
+{"\n\n---\n\n".join(assembled)}
+""".strip()
+                msgs = [
+                    {"role":"system","content":"You are a meticulous editor. Reply in Markdown."},
+                    {"role":"user","content":stitch_prompt}
+                ]
+                final_resp = client.chat.completions.create(
+                    model=chat_model, temperature=0.3, messages=msgs, max_tokens=1800
+                )
+                ch_state["draft"] = final_resp.choices[0].message.content
+                ch_state["status"] = "draft"
+                st.success("Draft created (longform).")
+                st.markdown(ch_state["draft"])
+            except Exception as e:
+                st.error(f"Longform drafting failed: {e}")
+
+        else:
+            prompt = f"""
 Draft Chapter {ch_num}: "{ch_state['title']}" for the book "{plan['title']}".
 Target length ~{target_words} words.
 Style sheet: {plan['style']}
@@ -592,17 +795,23 @@ Write a cohesive chapter in Markdown with:
 - smooth transitions
 - ending that tees up the next chapter.
 """.strip()
-        msgs = [{"role":"system","content":"You are a careful long-form writing assistant, reply in Markdown."},
-                {"role":"user","content":prompt}]
-        try:
-            resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
-            ch_state["draft"] = resp.choices[0].message.content
-            ch_state["status"] = "draft"
-            st.success("Draft created.")
-            st.markdown(ch_state["draft"])
-        except Exception as e:
-            st.error(f"Drafting failed: {e}")
+            msgs = [{"role":"system","content":"You are a careful long-form writing assistant, reply in Markdown."},
+                    {"role":"user","content":prompt}]
+            try:
+                resp = client.chat.completions.create(
+                    model=chat_model,
+                    temperature=0.5,
+                    messages=msgs,
+                    max_tokens=4096
+                )
+                ch_state["draft"] = resp.choices[0].message.content
+                ch_state["status"] = "draft"
+                st.success("Draft created.")
+                st.markdown(ch_state["draft"])
+            except Exception as e:
+                st.error(f"Drafting failed: {e}")
 
+    # -------- Revise --------
     if ch_state.get("draft"):
         goals = st.text_input("Revision goals (e.g., tighten intro, add example)")
         if st.button("Revise chapter"):
@@ -611,7 +820,7 @@ Write a cohesive chapter in Markdown with:
                 {"role":"user","content":f"Revise the chapter to meet these goals: {goals or 'Improve clarity and flow; preserve voice and length.'}\n\nChapter:\n{ch_state['draft']}"}
             ]
             try:
-                resp = client.chat.completions.create(model=chat_model, temperature=0.5, messages=msgs)
+                resp = client.chat.completions.create(model=chat_model, temperature=0.5, messages=msgs, max_tokens=1800)
                 ch_state["draft"] = resp.choices[0].message.content
                 ch_state["status"] = "revised"
                 st.success("Revised.")
