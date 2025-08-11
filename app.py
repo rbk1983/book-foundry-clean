@@ -1,3 +1,22 @@
+# app.py
+# Rahim's AI Book Studio — Streamlit app
+# - Upload/ingest sources (PDF/DOCX/MD/TXT) with GitHub persistence
+# - Auto-detect "master outline" and generate a strict source-mapping that mirrors it 1:1
+# - Draft chapters with retrieval from your corpus and inline source markers
+# - Export a Markdown manuscript
+#
+# Required Secrets (Settings → Secrets):
+#   OPENAI_API_KEY = "sk-..."
+#   GITHUB_TOKEN   = "ghp_... or github_pat_..."
+#   GH_REPO_OWNER  = "rbk1983"
+#   GH_REPO_NAME   = "book-foundry-clean"   # your storage repo
+#   GH_BRANCH      = ""                      # optional; leave blank to use default
+#
+# Notes:
+# - "Load all files from GitHub" pulls everything in /uploads into /data and re-ingests.
+# - Name your master outline file so it contains BOTH words: "outline" and "master",
+#   e.g., "BookOutline_MASTER.docx" or "outline_MASTER.txt".
+#   Then: Sources → Load all files from GitHub → Outline tab should show the detected file.
 
 import os, sys, time, math, hashlib, base64, json
 from typing import List, Dict, Any
@@ -188,7 +207,7 @@ if "plan" not in st.session_state:
         "title": "My Third Book",
         "thesis": "",
         "style": "",
-        "chapters": {}  # "1": {"title": "...", "synopsis": "...", "draft": "...", "status": "draft|revised|final"}
+        "chapters": {}  # "1": {"title": "...", "synopsis": "...", "draft": "...", "status": "..."}
     }
 
 if "corpus" not in st.session_state:
@@ -297,7 +316,7 @@ def add_records(texts: List[str], tags: List[str], source: str, model: str, adde
 with tab_sources:
     st.subheader("Upload sources (PDF/DOCX/MD/TXT)")
     files = st.file_uploader("Select files", type=["pdf","docx","md","markdown","txt"], accept_multiple_files=True)
-    tags_str = st.text_input("Tags for these files (e.g., Book1, Research)")
+    tags_str = st.text_input("Tags for these files (e.g., ChefsBook, HoteliersBook, Outline)")
 
     if st.button("Ingest files", type="primary"):
         if not files:
@@ -390,22 +409,50 @@ with tab_outline:
     with c2:
         plan["style"] = st.text_area("Style sheet (voice, tense, pacing, terminology)", value=plan["style"], height=140)
 
-    if st.button("Generate outline", type="primary"):
+    # Auto-detect master outline file in local /data (restored from GitHub)
+    outline_file = None
+    if os.path.exists("data"):
+        for fname in os.listdir("data"):
+            if "outline" in fname.lower() and "master" in fname.lower():
+                outline_file = fname
+                break
 
-            # --- Strict source mapping that mirrors the master outline exactly ---
+    if outline_file:
+        st.session_state["outline_file_path"] = os.path.join("data", outline_file)
+        st.caption(f"📄 Using master outline: **{outline_file}**")
+    else:
+        st.caption("⚠️ No master outline detected. Name it with both ‘outline’ and ‘master’ (e.g., `BookOutline_MASTER.docx`), then **Load all files from GitHub** in the Sources tab.")
+
+    if st.button("Generate outline", type="primary"):
+        msgs = [
+            {"role":"system","content":"You are a meticulous long-form book-writing assistant. Reply in clean Markdown."},
+            {"role":"user","content":f"Plan a new 250–300 page book.\nTitle: {plan['title']}\n\nThesis:\n{plan['thesis']}\n\nUse only my uploaded corpus as background.\nConstraints: 10–14 chapters, coherent arc.\nProduce: 3 title options, detailed TOC, 3–6 subtopics per chapter, 2–4 sentence synopsis per chapter, and a brief style sheet."}
+        ]
+        try:
+            resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
+            st.markdown(resp.choices[0].message.content)
+            st.info("Copy/paste chapter titles & synopses into the Draft tab.")
+        except Exception as e:
+            st.error(f"Outline generation failed: {e}")
+
+    # --- Strict source mapping that mirrors the master outline exactly ---
+    mapping_container = st.container()
+    with mapping_container:
+        colA, colB = st.columns([1,1])
+        with colA:
+            do_save_mapping = st.checkbox("Also save mapping to GitHub (/uploads)", value=True)
+        with colB:
+            mapping_filename = st.text_input("Mapping filename (no path)", value=f"mapping_{int(time.time())}.md")
+
     if st.button("Generate source mapping (lock to master outline)"):
         if not st.session_state.get("outline_file_path"):
-            st.error("No master outline detected. See note above and load your outline into /data first.")
+            st.error("No master outline detected. See note above and load your outline into /data first (Sources tab → Load all files from GitHub).")
         else:
-            # Short “goal/mission” you put in the Thesis box gives a lens for relevance
             thesis_mission = plan["thesis"] or "Create a unified, updated narrative based on my two books; maintain my voice and structure."
-
-            # Read the master outline text (supports .docx and text)
             outline_path = st.session_state["outline_file_path"]
             try:
                 ext = os.path.splitext(outline_path)[1].lower()
                 if ext == ".docx":
-                    from docx import Document as DocxDocument  # already imported earlier
                     _doc = DocxDocument(outline_path)
                     master_outline_text = "\n".join(p.text for p in _doc.paragraphs)
                 else:
@@ -427,7 +474,7 @@ Rules:
 ## Subchapter X.X: [Exact title]
 - [Source: filename] "short excerpt / anchor phrase" — why it fits
 - [Source: filename] "short excerpt / anchor phrase" — why it fits
-"""
+""".strip()
 
             content_for_llm = f"""
 MASTER OUTLINE (do not alter):
@@ -455,41 +502,29 @@ STYLE / VOICE GUIDANCE:
                 mapping_md = resp.choices[0].message.content
                 st.success("Source mapping created (mirrors master outline).")
                 st.markdown(mapping_md)
+
+                # Optional: save mapping to GitHub
+                if do_save_mapping:
+                    try:
+                        fname = mapping_filename.strip() or f"mapping_{int(time.time())}.md"
+                        if "/" in fname or "\\" in fname:
+                            st.warning("Mapping filename should not include a path; saving under /uploads automatically.")
+                            fname = os.path.basename(fname)
+                        rel = f"uploads/{fname}"
+                        gh_put_file(rel, mapping_md.encode("utf-8"), f"Add mapping {fname}")
+                        owner, repo, branch = gh_repo_info()
+                        link_branch = (branch or "main")
+                        st.info(f"Saved: https://github.com/{owner}/{repo}/blob/{link_branch}/{rel}")
+                    except Exception as e:
+                        st.error(f"Could not save mapping to GitHub: {e}")
             except Exception as e:
                 st.error(f"Source mapping failed: {e}")
-
-
-            # Auto-detect master outline file in local /data (restored from GitHub)
-    outline_file = None
-    if os.path.exists("data"):
-        for fname in os.listdir("data"):
-            if "outline" in fname.lower() and "master" in fname.lower():
-                outline_file = fname
-                break
-
-    if outline_file:
-        st.session_state["outline_file_path"] = os.path.join("data", outline_file)
-        st.caption(f"📄 Using master outline: **{outline_file}**")
-    else:
-        st.caption("⚠️ No master outline detected. Name it with both ‘outline’ and ‘master’ (e.g., `BookOutline_MASTER.docx`), then **Load all files from GitHub** in the Sources tab.")
-
-        msgs = [
-            {"role":"system","content":"You are a meticulous long-form book-writing assistant. Reply in clean Markdown."},
-            {"role":"user","content":f"Plan a new 250–300 page book.\nTitle: {plan['title']}\n\nThesis:\n{plan['thesis']}\n\nUse only my uploaded corpus as background.\nConstraints: 10–14 chapters, coherent arc.\nProduce: 3 title options, detailed TOC, 3–6 subtopics per chapter, 2–4 sentence synopsis per chapter, and a brief style sheet."}
-        ]
-        try:
-            resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
-            st.markdown(resp.choices[0].message.content)
-            st.info("Copy/paste chapter titles & synopses into the Draft tab.")
-        except Exception as e:
-            st.error(f"Outline generation failed: {e}")
 
 # ==================== Retrieval (in-memory) ====================
 def retrieve(query: str, k: int, tag_filter_text: str) -> List[Dict[str, Any]]:
     if not corpus:
         return []
     filters = {t.strip().lower() for t in tag_filter_text.split(",") if t.strip()}
-    # Guard: embed query only if non-empty
     q = (query or "").strip()
     if not q:
         return []
