@@ -391,6 +391,88 @@ with tab_outline:
         plan["style"] = st.text_area("Style sheet (voice, tense, pacing, terminology)", value=plan["style"], height=140)
 
     if st.button("Generate outline", type="primary"):
+
+            # --- Strict source mapping that mirrors the master outline exactly ---
+    if st.button("Generate source mapping (lock to master outline)"):
+        if not st.session_state.get("outline_file_path"):
+            st.error("No master outline detected. See note above and load your outline into /data first.")
+        else:
+            # Short “goal/mission” you put in the Thesis box gives a lens for relevance
+            thesis_mission = plan["thesis"] or "Create a unified, updated narrative based on my two books; maintain my voice and structure."
+
+            # Read the master outline text (supports .docx and text)
+            outline_path = st.session_state["outline_file_path"]
+            try:
+                ext = os.path.splitext(outline_path)[1].lower()
+                if ext == ".docx":
+                    from docx import Document as DocxDocument  # already imported earlier
+                    _doc = DocxDocument(outline_path)
+                    master_outline_text = "\n".join(p.text for p in _doc.paragraphs)
+                else:
+                    master_outline_text = open(outline_path, "r", encoding="utf-8", errors="ignore").read()
+            except Exception as e:
+                st.error(f"Could not read master outline: {e}")
+                master_outline_text = ""
+
+            strict_instructions = """
+Use only the chapter and subchapter structure from the uploaded master outline below.
+Rules:
+1) Do NOT create, remove, rename, paraphrase, or reorder any chapters or subchapters.
+2) Copy all section titles exactly as written in the outline.
+3) For each chapter/subchapter, list the most relevant excerpts from my ingested sources (two books + any uploads).
+4) If no material exists for a section, write: GAP — needs new research or original writing.
+5) Keep structure identical to the outline. Use this format:
+
+# Chapter X: [Exact title]
+## Subchapter X.X: [Exact title]
+- [Source: filename] "short excerpt / anchor phrase" — why it fits
+- [Source: filename] "short excerpt / anchor phrase" — why it fits
+"""
+
+            content_for_llm = f"""
+MASTER OUTLINE (do not alter):
+{master_outline_text}
+
+BOOK THESIS / MISSION:
+{thesis_mission}
+
+STYLE / VOICE GUIDANCE:
+{plan['style']}
+""".strip()
+
+            msgs = [
+                {"role":"system","content":"You are a meticulous book development editor. Follow instructions exactly and mirror the provided outline structure."},
+                {"role":"user","content":strict_instructions},
+                {"role":"user","content":content_for_llm},
+            ]
+
+            try:
+                resp = client.chat.completions.create(
+                    model=chat_model,
+                    temperature=0.2,  # low temp for strict adherence
+                    messages=msgs
+                )
+                mapping_md = resp.choices[0].message.content
+                st.success("Source mapping created (mirrors master outline).")
+                st.markdown(mapping_md)
+            except Exception as e:
+                st.error(f"Source mapping failed: {e}")
+
+
+            # Auto-detect master outline file in local /data (restored from GitHub)
+    outline_file = None
+    if os.path.exists("data"):
+        for fname in os.listdir("data"):
+            if "outline" in fname.lower() and "master" in fname.lower():
+                outline_file = fname
+                break
+
+    if outline_file:
+        st.session_state["outline_file_path"] = os.path.join("data", outline_file)
+        st.caption(f"📄 Using master outline: **{outline_file}**")
+    else:
+        st.caption("⚠️ No master outline detected. Name it with both ‘outline’ and ‘master’ (e.g., `BookOutline_MASTER.docx`), then **Load all files from GitHub** in the Sources tab.")
+
         msgs = [
             {"role":"system","content":"You are a meticulous long-form book-writing assistant. Reply in clean Markdown."},
             {"role":"user","content":f"Plan a new 250–300 page book.\nTitle: {plan['title']}\n\nThesis:\n{plan['thesis']}\n\nUse only my uploaded corpus as background.\nConstraints: 10–14 chapters, coherent arc.\nProduce: 3 title options, detailed TOC, 3–6 subtopics per chapter, 2–4 sentence synopsis per chapter, and a brief style sheet."}
