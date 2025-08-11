@@ -22,6 +22,9 @@ try:
 except Exception as e:
     st.sidebar.write("httpx import error:", e)
 
+# Ensure working data directory exists for temp files
+os.makedirs("data", exist_ok=True)
+
 # ==================== Secrets helper ====================
 def _sec(name: str):
     """Safe access for Streamlit secrets/env (no .get on st.secrets)."""
@@ -117,35 +120,6 @@ def gh_get_file(path_rel: str) -> bytes:
             return r2.content
         return b""
 
-# ==================== Web search helpers (Tavily REST) ====================
-def tavily_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
-    """Search the web via Tavily and return a list of {title, url, content}."""
-    api_key = _sec("TAVILY_API_KEY")
-    if not api_key:
-        raise RuntimeError("TAVILY_API_KEY missing in Secrets. Add it to enable web search.")
-    payload = {
-        "api_key": api_key,
-        "query": query,
-        "max_results": max_results,
-        "include_answer": False,
-        "include_images": False,
-        "include_domains": None,
-        "search_depth": "advanced"
-    }
-    with httpx.Client(timeout=60.0) as c:
-        r = c.post("https://api.tavily.com/search", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("results", [])
-        out = []
-        for item in results:
-            out.append({
-                "title": item.get("title") or "",
-                "url": item.get("url") or "",
-                "content": item.get("content") or ""
-            })
-        return out
-
 # ==================== Loaders, chunking, embeddings ====================
 from pypdf import PdfReader
 from docx import Document as DocxDocument
@@ -155,32 +129,43 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 def load_text_from_file(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        reader = PdfReader(path)
-        parts = []
-        for p in reader.pages:
-            try:
-                parts.append(p.extract_text() or "")
-            except Exception:
-                parts.append("")
-        return "\n".join(parts)
-    elif ext == ".docx":
-        doc = DocxDocument(path)
-        return "\n".join(p.text for p in doc.paragraphs)
-    elif ext in [".md", ".markdown"]:
-        html = markdown(open(path, "r", encoding="utf-8", errors="ignore").read())
-        return BeautifulSoup(html, "html.parser").get_text("\n")
-    else:
-        return open(path, "r", encoding="utf-8", errors="ignore").read()
+    try:
+        if ext == ".pdf":
+            reader = PdfReader(path)
+            parts = []
+            for p in reader.pages:
+                try:
+                    parts.append(p.extract_text() or "")
+                except Exception:
+                    parts.append("")
+            return "\n".join(parts).strip()
+        elif ext == ".docx":
+            doc = DocxDocument(path)
+            return "\n".join(p.text for p in doc.paragraphs).strip()
+        elif ext in [".md", ".markdown"]:
+            html = markdown(open(path, "r", encoding="utf-8", errors="ignore").read())
+            return BeautifulSoup(html, "html.parser").get_text("\n").strip()
+        else:
+            return open(path, "r", encoding="utf-8", errors="ignore").read().strip()
+    except Exception as e:
+        raise RuntimeError(f"Failed to read {os.path.basename(path)}: {e}")
 
 def chunk_text(text: str, chunk_size=1200, overlap=200) -> List[str]:
+    if not text or not text.strip():
+        return []
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=overlap,
         separators=["\n\n", "\n", ". ", "? ", "! ", " ", ""]
     )
-    return splitter.split_text(text)
+    pieces = [t.strip() for t in splitter.split_text(text)]
+    # Drop truly empty chunks
+    return [p for p in pieces if p]
 
 def embed_texts(texts: List[str], model: str) -> List[List[float]]:
+    # Guard: never call embeddings API with empty input
+    texts = [t for t in texts if t and t.strip()]
+    if not texts:
+        return []
     resp = client.embeddings.create(model=model, input=texts)
     return [d.embedding for d in resp.data]
 
@@ -207,24 +192,24 @@ if "plan" not in st.session_state:
     }
 
 if "corpus" not in st.session_state:
-    st.session_state.corpus = []  # list of {id,text,tags,source,emb,meta?}
+    st.session_state.corpus = []  # list of {id,text,tags,source,emb}
 
 plan = st.session_state.plan
 corpus: List[Dict[str, Any]] = st.session_state.corpus
 
 # ==================== Sidebar settings ====================
 st.title("Rahim's AI Book Studio")
-st.caption("Use your previous books + web research + uploads to outline and draft a new 250–300 page book.")
+st.caption("Use your previous books + uploads to outline and draft a new 250–300 page book.")
 
 with st.sidebar:
     st.header("Settings")
     plan["title"] = st.text_input("Project name", value=plan["title"]).strip()
     chat_model = st.text_input("Chat model", value="gpt-4o")
     embed_model = st.text_input("Embedding model", value="text-embedding-3-large")
-    temperature = st.slider("Creativity (temperature)", 0.0, 1.2, 0.7, 0.1)
-    top_k = st.slider("Top-K retrieved chunks", 1, 30, 10, 1)
-    chunk_size = st.slider("Chunk size", 600, 2400, 1200, 100)
-    overlap = st.slider("Chunk overlap", 50, 400, 200, 10)
+    temperature = st.slider("Creativity (temperature)", 0.0, 1.2, 0.5, 0.1)
+    top_k = st.slider("Top-K retrieved chunks", 1, 30, 8, 1)
+    chunk_size = st.slider("Chunk size", 600, 2400, 1000, 100)
+    overlap = st.slider("Chunk overlap", 50, 400, 150, 10)
     tag_filter = st.text_input("Tag filter (comma-sep, optional)", value="")
     persist_to_github = st.checkbox("Persist uploads to GitHub", value=True)
     st.caption("Files ≤100 MB saved under /uploads/ in your storage repo.")
@@ -283,14 +268,19 @@ with st.sidebar:
             st.error(f"Write failed (generic): {e}")
 
 # ==================== Tabs ====================
-tab_sources, tab_web, tab_outline, tab_draft, tab_export = st.tabs(
-    ["📥 Sources", "🌐 Web search", "🧭 Outline", "✍️ Draft", "📤 Export"]
+tab_sources, tab_outline, tab_draft, tab_export = st.tabs(
+    ["📥 Sources", "🧭 Outline", "✍️ Draft", "📤 Export"]
 )
 
-# ==================== SOURCES ====================
-def add_records(texts: List[str], tags: List[str], source: str):
-    embs = embed_texts(texts, model=embed_model)
-    for i, (text, emb) in enumerate(zip(texts, embs)):
+# ==================== Utility to add records safely ====================
+def add_records(texts: List[str], tags: List[str], source: str, model: str, added_counter: Dict[str, int] = None):
+    # Filter empty strings before embedding
+    clean_texts = [t for t in texts if t and t.strip()]
+    if not clean_texts:
+        return 0
+    embs = embed_texts(clean_texts, model=model)
+    count = 0
+    for i, (text, emb) in enumerate(zip(clean_texts, embs)):
         corpus.append({
             "id": f"{sha16(source)}:{i}:{len(corpus)}",
             "text": text,
@@ -298,7 +288,12 @@ def add_records(texts: List[str], tags: List[str], source: str):
             "source": source,
             "emb": emb,
         })
+        count += 1
+    if added_counter is not None:
+        added_counter["n"] = added_counter.get("n", 0) + count
+    return count
 
+# ==================== SOURCES ====================
 with tab_sources:
     st.subheader("Upload sources (PDF/DOCX/MD/TXT)")
     files = st.file_uploader("Select files", type=["pdf","docx","md","markdown","txt"], accept_multiple_files=True)
@@ -309,9 +304,8 @@ with tab_sources:
             st.warning("No files selected.")
         else:
             tags = [t.strip() for t in tags_str.split(",") if t.strip()] or ["General"]
-            added_chunks = 0
+            added = {"n": 0}
             uploaded_to_gh = []
-            os.makedirs("data", exist_ok=True)
 
             for f in files:
                 raw_bytes = f.read()
@@ -333,6 +327,7 @@ with tab_sources:
                         st.error(f"GitHub upload failed for {f.name}: {e}")
                         continue
 
+                # Save to temp then parse
                 tmp = os.path.join("data", f"{int(time.time())}_{f.name}")
                 with open(tmp, "wb") as out:
                     out.write(raw_bytes)
@@ -340,16 +335,18 @@ with tab_sources:
                 try:
                     raw = load_text_from_file(tmp)
                     pieces = chunk_text(raw, chunk_size=chunk_size, overlap=overlap)
-                    add_records(pieces, tags, f.name)
-                    added_chunks += len(pieces)
+                    added_count = add_records(pieces, tags, f.name, embed_model, added_counter=added)
+                    if added_count == 0:
+                        st.warning(f"‘{f.name}’ contained no extractable text; skipped.")
                 except Exception as e:
                     st.error(f"Failed to process {f.name}: {e}")
 
-            st.success(f"Ingested {len(files)} file(s) → {added_chunks} chunks.")
+            st.success(f"Ingested {len(files)} file(s) → {added['n']} chunks.")
             if uploaded_to_gh:
-                link_branch = (gh_repo_info()[2] or "main")
+                owner, repo, branch = gh_repo_info()
+                link_branch = branch or "main"
                 st.info("Saved to GitHub:\n" + "\n".join(
-                    [f"- https://github.com/{gh_repo_info()[0]}/{gh_repo_info()[1]}/blob/{link_branch}/{p}" for p in uploaded_to_gh]
+                    [f"- https://github.com/{owner}/{repo}/blob/{link_branch}/{p}" for p in uploaded_to_gh]
                 ))
 
     if corpus:
@@ -360,7 +357,7 @@ with tab_sources:
     st.markdown("#### Restore from GitHub storage")
     if st.button("Load all files from GitHub"):
         try:
-            os.makedirs("data", exist_ok=True)
+            os.makedirs("data", exist_ok=True)  # ensure folder exists
             items = gh_list_dir("uploads")
             if not items:
                 st.info("No files in GitHub /uploads yet.")
@@ -372,62 +369,52 @@ with tab_sources:
                     tmp = os.path.join("data", name)
                     with open(tmp, "wb") as out:
                         out.write(b)
-                    raw = load_text_from_file(tmp)
-                    pieces = chunk_text(raw, chunk_size=chunk_size, overlap=overlap)
-                    add_records(pieces, ["GitHub"], name)
-                    reingested += len(pieces)
+                    try:
+                        raw = load_text_from_file(tmp)
+                        pieces = chunk_text(raw, chunk_size=chunk_size, overlap=overlap)
+                        reingested += add_records(pieces, ["GitHub"], name, embed_model)
+                    except Exception as e:
+                        st.error(f"Failed to reprocess {name}: {e}")
                 st.success(f"Restored {len(items)} file(s) → {reingested} chunks.")
         except httpx.HTTPStatusError as e:
             st.error(f"GitHub restore failed: {e}\n\n{e.response.text[:500]}")
         except Exception as e:
             st.error(f"GitHub restore failed: {e}")
 
-# ==================== WEB SEARCH ====================
-with tab_web:
-    st.subheader("Search the web and add notes to your corpus")
-    st.caption("Powered by Tavily. Add TAVILY_API_KEY to Secrets. Results are tagged as 'Web'.")
-    web_query = st.text_input("Web query (e.g., 'Michelin Guide methodology changes 2024')")
-    max_results = st.slider("Max results", 1, 10, 5, 1)
-    if st.button("Search web and add to corpus"):
-        try:
-            results = tavily_search(web_query, max_results=max_results)
-            added = 0
-            for r in results:
-                text = f"{r['title']}\nURL: {r['url']}\n\n{r['content']}"
-                pieces = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-                # tag with 'Web' and keep URL in source
-                add_records(pieces, ["Web"], r['url'] or r['title'] or "web")
-                added += len(pieces)
-            st.success(f"Added web research → {added} chunks across {len(results)} result(s).")
-            if results:
-                st.info("Top sources:\n" + "\n".join([f"- {r['title']} ({r['url']})" for r in results[:5]]))
-        except Exception as e:
-            st.error(f"Web search failed: {e}")
-
 # ==================== OUTLINE ====================
 with tab_outline:
     st.subheader("Thesis & Style")
     c1, c2 = st.columns(2)
     with c1:
-        plan["thesis"] = st.text_area("Book thesis or goal", value=plan["thesis"], height=120)
+        plan["thesis"] = st.text_area("Book thesis or goal", value=plan["thesis"], height=140)
     with c2:
-        plan["style"] = st.text_area("Style sheet (voice, tense, pacing, terminology)", value=plan["style"], height=120)
+        plan["style"] = st.text_area("Style sheet (voice, tense, pacing, terminology)", value=plan["style"], height=140)
 
     if st.button("Generate outline", type="primary"):
         msgs = [
             {"role":"system","content":"You are a meticulous long-form book-writing assistant. Reply in clean Markdown."},
-            {"role":"user","content":f"Plan a new 250–300 page book.\nTitle: {plan['title']}\n\nThesis:\n{plan['thesis']}\n\nUse my uploaded corpus as background.\nConstraints: 12–18 chapters, coherent arc.\nProduce: 3 title options, detailed TOC, 2–4 sentence synopsis per chapter, and a brief style sheet."}
+            {"role":"user","content":f"Plan a new 250–300 page book.\nTitle: {plan['title']}\n\nThesis:\n{plan['thesis']}\n\nUse only my uploaded corpus as background.\nConstraints: 10–14 chapters, coherent arc.\nProduce: 3 title options, detailed TOC, 3–6 subtopics per chapter, 2–4 sentence synopsis per chapter, and a brief style sheet."}
         ]
-        resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
-        st.markdown(resp.choices[0].message.content)
-        st.info("Copy/paste chapter titles & synopses into the Draft tab.")
+        try:
+            resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
+            st.markdown(resp.choices[0].message.content)
+            st.info("Copy/paste chapter titles & synopses into the Draft tab.")
+        except Exception as e:
+            st.error(f"Outline generation failed: {e}")
 
 # ==================== Retrieval (in-memory) ====================
 def retrieve(query: str, k: int, tag_filter_text: str) -> List[Dict[str, Any]]:
     if not corpus:
         return []
     filters = {t.strip().lower() for t in tag_filter_text.split(",") if t.strip()}
-    qvec = embed_texts([query], model=embed_model)[0]
+    # Guard: embed query only if non-empty
+    q = (query or "").strip()
+    if not q:
+        return []
+    qvecs = embed_texts([q], model=embed_model)
+    if not qvecs:
+        return []
+    qvec = qvecs[0]
     scored = []
     for rec in corpus:
         if filters and not (set(map(str.lower, rec["tags"])) & filters):
@@ -464,26 +451,11 @@ with tab_draft:
     ch_num = st.text_input("Chapter number", value=default_ch)
     ch_state = plan["chapters"].setdefault(ch_num, {"title":"", "synopsis":"", "draft":"", "status":"draft"})
     ch_state["title"] = st.text_input("Chapter title", value=ch_state["title"])
-    ch_state["synopsis"] = st.text_area("Chapter synopsis", value=ch_state["synopsis"], height=120)
+    ch_state["synopsis"] = st.text_area("Chapter synopsis", value=ch_state["synopsis"], height=140)
     target_words = st.number_input("Target words", 800, 8000, 3500, 100)
     query_hint = st.text_input("Optional retrieval hint (keywords)")
-    include_web = st.checkbox("Include fresh web research before drafting", value=False)
-    web_results_for_draft = st.slider("Web results to add (if enabled)", 1, 8, 4, 1)
 
     if st.button("Retrieve & Draft", type="primary"):
-        # Optional new web research
-        if include_web:
-            try:
-                wq = query_hint or f"{plan['title']} {ch_state['title']} {ch_state['synopsis']}"
-                results = tavily_search(wq, max_results=web_results_for_draft)
-                for r in results:
-                    text = f"{r['title']}\nURL: {r['url']}\n\n{r['content']}"
-                    pieces = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-                    add_records(pieces, ["Web"], r['url'] or r['title'] or "web")
-                st.success(f"Added {len(results)} web result(s) to the corpus for this draft.")
-            except Exception as e:
-                st.warning(f"Web research skipped (error): {e}")
-
         q = query_hint or f"{plan['title']} - {ch_state['title']} - {ch_state['synopsis']}"
         hits = retrieve(q, top_k, tag_filter)
         context = make_context(hits)
@@ -505,11 +477,14 @@ Write a cohesive chapter in Markdown with:
 """.strip()
         msgs = [{"role":"system","content":"You are a careful long-form writing assistant, reply in Markdown."},
                 {"role":"user","content":prompt}]
-        resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
-        ch_state["draft"] = resp.choices[0].message.content
-        ch_state["status"] = "draft"
-        st.success("Draft created.")
-        st.markdown(ch_state["draft"])
+        try:
+            resp = client.chat.completions.create(model=chat_model, temperature=temperature, messages=msgs)
+            ch_state["draft"] = resp.choices[0].message.content
+            ch_state["status"] = "draft"
+            st.success("Draft created.")
+            st.markdown(ch_state["draft"])
+        except Exception as e:
+            st.error(f"Drafting failed: {e}")
 
     if ch_state.get("draft"):
         goals = st.text_input("Revision goals (e.g., tighten intro, add example)")
@@ -518,11 +493,14 @@ Write a cohesive chapter in Markdown with:
                 {"role":"system","content":"You are a meticulous editor. Reply in Markdown, preserving headings."},
                 {"role":"user","content":f"Revise the chapter to meet these goals: {goals or 'Improve clarity and flow; preserve voice and length.'}\n\nChapter:\n{ch_state['draft']}"}
             ]
-            resp = client.chat.completions.create(model=chat_model, temperature=0.5, messages=msgs)
-            ch_state["draft"] = resp.choices[0].message.content
-            ch_state["status"] = "revised"
-            st.success("Revised.")
-            st.markdown(ch_state["draft"])
+            try:
+                resp = client.chat.completions.create(model=chat_model, temperature=0.5, messages=msgs)
+                ch_state["draft"] = resp.choices[0].message.content
+                ch_state["status"] = "revised"
+                st.success("Revised.")
+                st.markdown(ch_state["draft"])
+            except Exception as e:
+                st.error(f"Revision failed: {e}")
 
 # ==================== EXPORT ====================
 with tab_export:
