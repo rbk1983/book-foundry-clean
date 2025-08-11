@@ -1,0 +1,96 @@
+{
+  "title": "Five-Star Secrets: 100 Leadership Lessons from the World's Best Luxury Hoteliers and Michelin-Starred Chefs",
+  "author": "",
+  "thesis": "The goal of Five-Star Secrets: 100 Leadership Lessons from the World's Best Luxury Hoteliers and Michelin-Starred Chefs is to distill the wisdom, strategies, and philosophies of the most exceptional leaders in hospitality and gastronomy into a practical, inspiring guide for anyone seeking excellence in leadership, creativity, and service. By blending insights from five-star hoteliers and Michelin-starred chefs—drawn from real interviews, stories, and experiences—the book aims to reveal the common mindset, discipline, and vision that enable these individuals to consistently deliver world-class experiences, and to show how those same principles can be applied in any field where performance, innovation, and human connection matter most.\n",
+  "style": "Voice & Style Sheet\nTense:\n\nPast tense for personal stories, career journeys, and contextual anecdotes (“When Ferran Adrià closed elBulli, he…”).\n\nPresent tense for leadership principles, universal truths, and reflective commentary (“Great leaders know that…”, “In any high-performing kitchen, clarity matters…”).\n\nPacing:\n\nOpening Hook (1–3 sentences): Start with a vivid, specific detail—a quote, a scene, or an action in motion.\n\nExample: “On the morning of a royal visit, Aaron Kaupp ordered 100 helium balloons to fill the suite before the guests arrived.”\n\nStory & Context (3–6 sentences): Describe the background, challenge, or pivotal moment, weaving in personality and environment.\n\nExample: “For Kaupp, the gesture wasn’t about grandeur; it was about anticipating unspoken needs and creating a memory.”\n\nLeadership Insight (2–4 sentences): Extract the principle, linking it to broader leadership themes.\n\nExample: “True luxury leaders focus on emotional connection, not just operational perfection.”\n\nTakeaway (1–2 sentences): End with a concise, action-oriented insight for the reader.\n\nExample: “Look for moments to surprise and delight your stakeholders—it’s how you turn satisfaction into loyalty.”\n\nTerminology:\n\nHospitality Terms: Guest journey, front-of-house, back-of-house, turn-down service, concierge, property, service recovery.\n\nCulinary Terms: Mise en place, brigade, plating, seasonal menu, tasting menu, foraging, terroir.\n\nDefine briefly for non-industry readers the first time a term appears, then use freely.\n\nAudience:\n\nLeaders, managers, entrepreneurs, and creatives in any sector who want actionable insights from the world’s top hoteliers and chefs.\n\nReaders who enjoy behind-the-scenes stories, vivid detail, and lessons they can apply immediately.\n\nTone:\n\nAuthoritative yet human—your expertise frames the lessons, but the voice stays warm and inclusive.\n\nInspirational and practical—stories should spark imagination but always tie back to a tangible principle.\n\nAvoid corporate jargon and overused buzzwords; favor fresh, descriptive phrasing.\n\nExample Lesson Flow Template (apply to all 100 lessons) in narrative form:\n\nHook: A vivid detail, quote, or action.\n\nStory: Context and key events, told in past tense.\n\nInsight: Present-tense analysis of the leadership principle.\n\nTakeaway: 1–2 sentence actionable lesson.",
+  "num_chapters": 12,
+  "words_per_chapter": 3500,
+  "chapters": [
+    {
+      "num": "1",
+      "title": "Introduction",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "2",
+      "title": "Chapter Placeholder 1",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "3",
+      "title": "Chapter Placeholder 2",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "4",
+      "title": "Chapter Placeholder 3",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "5",
+      "title": "Chapter Placeholder 4",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "6",
+      "title": "Chapter Placeholder 5",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "7",
+      "title": "Chapter Placeholder 6",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "8",
+      "title": "Chapter Placeholder 7",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "9",
+      "title": "Chapter Placeholder 8",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "10",
+      "title": "Chapter Placeholder 9",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "11",
+      "title": "Chapter Placeholder 10",
+      "synopsis": "",
+      "sections": []
+    },
+    {
+      "num": "12",
+      "title": "Final Conclusion",
+      "synopsis": "",
+      "sections": []
+    }
+  ],
+  "completed": [],
+  "next_index": 0,
+  "urls_mode": "none",
+  "use_tavily": false,
+  "research_guidance": "",
+  "recent_year_cutoff": 2019,
+  "prefer_academic": true,
+  "include_domains": [],
+  "exclude_domains": [],
+  "top_k": 10,
+  "chunk_size": 1000,
+  "chunk_overlap": 150,
+  "temperature": 0.6,
+  "timestamp": 1754949785
+}
