@@ -962,3 +962,311 @@ if resume:
             generate_book(run_mode="resume", resume_payload={"ts": ts, "manifest": manifest})
     except Exception as e:
         st.error(f"Resume failed: {e}")
+
+
+          # ---------- Post-Process Manuscript ----------
+st.divider()
+st.subheader("4) Post-process manuscript (cleanup + quotes + diff)")
+
+st.markdown(
+    "Upload your full draft (Markdown or Word). Choose the fixes you want, "
+    "then download a cleaned version and a diff. If your books were ingested, this can also "
+    "distribute verbatim quotes across chapters with proper attribution."
+)
+
+pp_file = st.file_uploader("Upload manuscript (.md or .docx)", type=["md", "docx"], accept_multiple_files=False, key="pp_upl")
+col_pp1, col_pp2, col_pp3 = st.columns(3)
+with col_pp1:
+    fix_conclusion = st.checkbox("Ensure single Conclusion per chapter", value=True)
+    condense_heads = st.checkbox("Condense subheadings (≤ 4 / chapter)", value=True)
+with col_pp2:
+    dedup_redund = st.checkbox("Remove redundant paragraphs", value=True)
+    normalize_heads = st.checkbox("Normalize heading levels", value=True)
+with col_pp3:
+    quote_enable = st.checkbox("Distribute verbatim quotes from books", value=True)
+    min_quotes = st.number_input("Min quotes / chapter", 0, 6, 2, 1)
+    max_quotes = st.number_input("Max quotes / chapter", 0, 10, 3, 1)
+
+st.caption("Tip: leave quotes enabled if you want richer, example-driven chapters from your books. Web links already in your draft are preserved.")
+
+pp_go = st.button("🧹 Clean & Enrich Manuscript", type="primary", disabled=st.session_state.busy)
+
+def _docx_to_md_simple(file_bytes: bytes) -> str:
+    from docx import Document as _Doc
+    import re as _re
+    doc = _Doc(io.BytesIO(file_bytes))
+    lines = []
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+        if not txt:
+            lines.append("")
+            continue
+        style = (p.style.name or "").lower()
+        if "heading" in style:
+            lvl = 1
+            m = _re.search(r"heading\s*(\d+)", style)
+            if m:
+                lvl = max(1, min(6, int(m.group(1))))
+            lines.append("#" * lvl + " " + txt)
+        else:
+            lines.append(txt)
+    return "\n".join(lines)
+
+def _split_chapters(md_text: str):
+    # returns list of (heading_line, chapter_md)
+    chunks = []
+    cur_head = None
+    cur = []
+    for line in md_text.splitlines():
+        if line.startswith("# Chapter "):  # generator starts chapters like this
+            if cur_head is not None:
+                chunks.append((cur_head, "\n".join(cur).strip()))
+                cur = []
+            cur_head = line.strip()
+        else:
+            cur.append(line)
+    if cur_head is not None:
+        chunks.append((cur_head, "\n".join(cur).strip()))
+    return chunks
+
+def _ensure_single_conclusion(ch_md: str) -> str:
+    # Keep only the LAST "## Conclusion", merge content of earlier pseudo-conclusions into prior section body
+    parts = ch_md.split("\n")
+    concl_idx = [i for i,l in enumerate(parts) if l.strip().lower() in ("## conclusion","## final conclusion")]
+    if len(concl_idx) <= 1:
+        return ch_md
+    last = concl_idx[-1]
+    # remove headings of earlier conclusions but keep their paragraphs
+    keep = []
+    i = 0
+    while i < len(parts):
+        if i in concl_idx[:-1] and parts[i].strip().lower().startswith("##"):
+            i += 1
+            continue
+        keep.append(parts[i])
+        i += 1
+    return "\n".join(keep)
+
+def _condense_subheads(ch_md: str, max_headings: int = 4) -> str:
+    lines = ch_md.split("\n")
+    # collect level-2 headings (## ...)
+    idxs = [i for i,l in enumerate(lines) if l.strip().startswith("## ") and l.strip().lower() not in ("## conclusion","## final conclusion")]
+    if len(idxs) <= max_headings:
+        return ch_md
+    # Keep the first N-1 plus Conclusion at the end
+    keep_idxs = set()
+    for i in idxs[:max_headings]:
+        keep_idxs.add(i)
+    # For removed sections, downgrade their content (strip the heading line)
+    out = []
+    for i, l in enumerate(lines):
+        if i in idxs and i not in keep_idxs:
+            # skip the heading but keep subsequent lines
+            continue
+        out.append(l)
+    return "\n".join(out)
+
+def _dedup_paragraphs(ch_md: str) -> str:
+    # remove near-duplicate paragraphs within a chapter
+    paras = [p.strip() for p in ch_md.split("\n\n")]
+    seen = set()
+    out = []
+    for p in paras:
+        key = re.sub(r"\W+"," ", p.lower()).strip()
+        key = key[:280]  # cheap hash
+        if key and key not in seen:
+            seen.add(key)
+            out.append(p)
+    return "\n\n".join(out)
+
+def _normalize_heading_levels(ch_md: str) -> str:
+    # enforce: chapter title starts at H1 (already outside), section heads at H2, subheads at H3, no deeper
+    lines = ch_md.split("\n")
+    out = []
+    for l in lines:
+        if l.startswith("#####"):  # squash very deep levels
+            out.append("### " + l.lstrip("#").strip())
+        elif l.startswith("####"):
+            out.append("### " + l.lstrip("#").strip())
+        elif l.startswith("### "):
+            out.append(l)
+        elif l.startswith("## "):
+            out.append(l)
+        elif l.startswith("# "):
+            out.append("## " + l[2:])  # inside chapter, demote stray H1 to H2
+        else:
+            out.append(l)
+    return "\n".join(out)
+
+def _extract_person_from_source_name(source_name: str) -> Optional[str]:
+    # try to derive a person name from chunk source (your books often have "First Last" at section starts)
+    s = (source_name or "").strip()
+    s = re.sub(r"\.\w+$","", s)
+    return s if s and len(s.split()) >= 2 else None
+
+def _pick_quotes_for_chapter(ch_title: str, k: int = 10, want: int = 2) -> List[Tuple[str,str]]:
+    """
+    Returns list of (quote_text, attribution_line)
+    Pulls from ingested book chunks. Prefers content with quotation marks; otherwise selects strong 1-2 sentence spans.
+    """
+    if not records:
+        return []
+    hits = retrieve(f'{ch_title} leadership creativity service guest experience examples quotes', k=k, tags=["Books"])
+    quotes = []
+    used_sources = set()
+    for h in hits:
+        txt = h["text"]
+        src = h.get("source","")
+        # Try to find verbatim quoted spans
+        spans = re.findall(r"[“\"]([^”\"]{40,420})[”\"]", txt)  # quote content 40-420 chars
+        person = _extract_person_from_source_name(src) or ""
+        # Fallback: pick a strong sentence (but it must be verbatim from the chunk)
+        if not spans:
+            sents = re.split(r"(?<=[\.\!\?])\s+", txt.strip())
+            sents = [s for s in sents if 60 <= len(s) <= 260]
+            if sents:
+                spans = [sents[0]]
+        if spans and (src not in used_sources):
+            q = spans[0].strip()
+            # VERY IMPORTANT: we only wrap in quotes because it is verbatim from the chunk.
+            # Build a generic attribution scaffold; you can refine later if your source metadata contains role/location.
+            attrib = person or (src if src else "Source Book")
+            # Try to hint role/country from content if present (best-effort; safe fallback to name only)
+            line = f"— {attrib}"
+            quotes.append((f"“{q}”", line))
+            used_sources.add(src)
+        if len(quotes) >= want:
+            break
+    return quotes
+
+def _insert_quotes_into_chapter(ch_head: str, ch_md: str, min_q: int, max_q: int) -> str:
+    if max_q <= 0 or min_q <= 0:
+        return ch_md
+    title = re.sub(r"^#*\s*Chapter\s+\d+:\s*","", ch_head).strip()
+    want = max(min_q, 1)
+    quotes = _pick_quotes_for_chapter(title, k=18, want=min(max_q, want))
+    if not quotes:
+        return ch_md
+    # Insert quotes after the first H2 section (or at top if none)
+    lines = ch_md.split("\n")
+    insert_at = 0
+    for i, l in enumerate(lines):
+        if l.strip().startswith("## ") and l.strip().lower() not in ("## conclusion","## final conclusion"):
+            insert_at = i + 1
+            break
+    block = []
+    for q, who in quotes[:max_q]:
+        block.append("> " + q)
+        block.append("> " + who)
+        block.append("")
+    new_lines = lines[:insert_at] + [""] + block + lines[insert_at:]
+    return "\n".join(new_lines)
+
+def _rebuild_docx_and_save(title: str, thesis_local: str, author: str, md_text: str, out_prefix: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    # returns (md_link, docx_link, diff_link) github paths if saved
+    ts_final = int(time.time())
+    safe_title = safe_title_slug(title)
+    md_name = f"{safe_title}_{out_prefix}_{ts_final}.md"
+    docx_name = f"{safe_title}_{out_prefix}_{ts_final}.docx"
+    diff_name = f"{safe_title}_{out_prefix}_{ts_final}_DIFF.md"
+
+    # Save Markdown
+    md_bytes = md_text.encode("utf-8")
+    try:
+        res_md = gh_put_file(f"outputs/{md_name}", md_bytes, f"Add postprocessed {md_name}")
+        owner, repo, branch = gh_repo_info()
+        link_branch = branch or "main"
+        md_link = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res_md.get('content',{}).get('path', f'outputs/{md_name}')}"
+    except Exception:
+        md_link = None
+
+    # Build Docx
+    try:
+        docx_bytes = md_to_docx(md_text, title, thesis_local, author=author)
+        res_docx = gh_put_file(f"outputs/{docx_name}", docx_bytes, f"Add postprocessed {docx_name}")
+        owner, repo, branch = gh_repo_info()
+        link_branch = branch or "main"
+        docx_link = f"https://github.com/{owner}/{repo}/blob/{link_branch}/{res_docx.get('content',{}).get('path', f'outputs/{docx_name}')}"
+    except Exception:
+        docx_link = None
+
+    return md_link, docx_link, None
+
+if pp_go:
+    if not pp_file:
+        st.warning("Please upload a manuscript file.")
+    else:
+        try:
+            # 1) Load manuscript to Markdown
+            if pp_file.name.lower().endswith(".docx"):
+                md_raw = _docx_to_md_simple(pp_file.read())
+            else:
+                md_raw = pp_file.read().decode("utf-8", errors="ignore")
+            md_orig = md_raw
+
+            # 2) Split into chapters (keeps your doc header outside)
+            header, chapters_md = "", []
+            if "\n# Chapter " in md_orig:
+                header, rest = md_orig.split("\n# Chapter ", 1)
+                chapters = _split_chapters("# Chapter " + rest)
+            else:
+                # Fallback: treat whole doc as one chapter body
+                chapters = [("# Chapter 1: Untitled", md_orig)]
+                header = ""
+
+            revised = []
+            import difflib as _dif
+
+            for head, body in chapters:
+                ch = body
+
+                # Normalize heading levels
+                if normalize_heads:
+                    ch = _normalize_heading_levels(ch)
+
+                # Ensure single conclusion
+                if fix_conclusion:
+                    ch = _ensure_single_conclusion(ch)
+
+                # Condense subheads
+                if condense_heads:
+                    ch = _condense_subheads(ch, max_headings=4)
+
+                # Deduplicate paragraphs
+                if dedup_redund:
+                    ch = _dedup_paragraphs(ch)
+
+                # Insert quotes from books
+                if quote_enable and max_quotes > 0:
+                    ch = _insert_quotes_into_chapter(head, ch, min_q=int(min_quotes), max_q=int(max_quotes))
+
+                revised.append((head, ch))
+
+            # Reassemble
+            manuscript_pp = (header.strip() + "\n\n" if header.strip() else "") + "\n\n".join(
+                [f"{h}\n\n{b}".strip() for (h,b) in revised]
+            ).strip()
+
+            # 3) Diff for your review
+            diff_text = "\n".join(_dif.unified_diff(md_orig.splitlines(), manuscript_pp.splitlines(), lineterm="", fromfile="original.md", tofile="revised.md"))
+
+            # 4) Downloads
+            st.download_button("⬇️ Download cleaned manuscript (Markdown)", manuscript_pp, file_name="manuscript_cleaned.md")
+            try:
+                docx_bytes_pp = md_to_docx(manuscript_pp, book_title or "Revised Manuscript", thesis or "", author=_sec("BOOK_AUTHOR") or "")
+                st.download_button("⬇️ Download cleaned manuscript (Word .docx)", docx_bytes_pp, file_name="manuscript_cleaned.docx")
+            except Exception as e:
+                st.warning(f"Could not make .docx: {e}")
+
+            st.download_button("⬇️ Download diff (MD)", diff_text, file_name="manuscript_diff.md")
+
+            # 5) Save to GitHub (optional, automatic)
+            md_link, docx_link, _ = _rebuild_docx_and_save(book_title or "Revised Manuscript", thesis or "", _sec("BOOK_AUTHOR") or "", manuscript_pp, out_prefix="POST")
+            if md_link:
+                st.success(f"Saved cleaned Markdown to GitHub: {md_link}")
+            if docx_link:
+                st.success(f"Saved cleaned Word to GitHub: {docx_link}")
+
+            st.success("✅ Post-processing complete.")
+        except Exception as e:
+            st.error(f"Post-processing failed: {e}")
