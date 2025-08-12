@@ -389,6 +389,7 @@ def parse_outline_lines(text: str) -> List[Dict[str,Any]]:
 def chapter_section_plan(ch_num: str, ch_title: str, ch_synopsis: str, target_words: int, max_sections: int, context: str, forced_sections: Optional[List[str]]=None, model: str="gpt-4o") -> str:
     if forced_sections:
         fs = [s.strip() for s in forced_sections if s.strip()]
+        # enforce a single final Conclusion only
         fs = [s for s in fs if s.lower() not in ("conclusion", "final conclusion")]
         if fs and fs[-1].lower() != "conclusion":
             fs.append("Conclusion")
@@ -632,6 +633,7 @@ def generate_book(run_mode: str,
                   temperature: float):
     st.session_state.busy = True
     try:
+        # Heartbeat for watchdog
         st.session_state.last_tick = time.time()
 
         thesis_hits = retrieve(thesis or book_title, k=top_k, tags=None) if records else []
@@ -676,7 +678,7 @@ def generate_book(run_mode: str,
         total_ch = len(chapters)
 
         for idx in range(start_idx, total_ch):
-            st.session_state.last_tick = time.time()
+            st.session_state.last_tick = time.time()  # heartbeat
             c = chapters[idx]
             ch_num = c["num"]; ch_title = c["title"]; ch_syn = c.get("synopsis","")
             progress.progress(idx/total_ch, text=f"Drafting Chapter {ch_num}: {ch_title}")
@@ -715,7 +717,7 @@ def generate_book(run_mode: str,
                     effective_urls.append(u); seen.add(u)
 
             forced_secs = c.get("sections") if isinstance(c.get("sections"), list) and c.get("sections") else None
-            sections_target = max(3, min(4, int(round(manifest.get("words_per_chapter", 3000)/1000))))
+            sections_target = max(3, min(4, int(round(manifest.get("words_per_chapter", 3000)/1000))))  # 3–4 sections
             plan_text = chapter_section_plan(ch_num, ch_title, ch_syn, manifest.get("words_per_chapter", 3000), sections_target, ctx, forced_sections=forced_secs, model=model)
 
             sec_texts = []
@@ -877,119 +879,42 @@ def _normalize_heading_levels(ch_md: str) -> str:
         else: out.append(l)
     return "\n".join(out)
 
-# ---- People & quotes balancing ----
-def _extract_person_from_attrib_line(line: str) -> Optional[str]:
-    m = re.search(r"—\s*([A-Z][A-Za-z]+(?:\s[A-Z][A-Za-z\-\']+)+)", line.strip())
+
+def _extract_person_from_attrib_line(line: str):
+    m = re.search(r"—\s*([A-Z][A-Za-z]+(?:\s[A-Z][A-Za-z\-\']+)+)", (line or "").strip())
     return m.group(1).strip() if m else None
 
-def _quote_blocks(ch_md: str) -> List[Tuple[int,int,str,str]]:
+def _quote_blocks(ch_md: str):
+    """Find quote blocks as pairs:
+    returns list of (start_idx, end_idx_exclusive, quote_line, attrib_line) where lines are '> “quote”' and next line starts '> —'
     """
-    Find quote blocks in chapter:
-    returns list of (start_idx, end_idx_exclusive, quote_line, attrib_line)
-    """
-    lines = ch_md.split("\n")
+    lines = (ch_md or "").split("\n")
     out = []
     i = 0
     while i < len(lines):
-        if lines[i].strip().startswith("> ") and not lines[i].strip().startswith("> —"):
-            qline = lines[i]
+        li = lines[i].strip()
+        if li.startswith("> ") and not li.startswith("> —"):
             if i+1 < len(lines) and lines[i+1].strip().startswith("> —"):
-                out.append((i, i+2, qline, lines[i+1]))
+                out.append((i, i+2, lines[i], lines[i+1]))
                 i += 2
                 continue
         i += 1
     return out
 
-def _build_people_index_from_records(k: int = 80) -> List[Tuple[str,str]]:
+
+def _extract_person_from_source_name(source_name: str) -> Optional[str]:
+    s = (source_name or "").strip()
+    s = re.sub(r"\.\w+$","", s)
+    return s if s and len(s.split()) >= 2 else None
+
+def _pick_quotes_for_chapter(ch_title: str, k: int = 18, want: int = 2) -> List[Tuple[str,str]]:
     if not records: return []
-    hits = retrieve("leadership creativity service guest experience quotes exemplars hotels restaurants chefs", k=k, tags=["Books"])
-    quotes = []
-    used = set()
-    for h in hits:
-        txt = h["text"]; src = h.get("source","")
-        spans = re.findall(r"[“\"]([^”\"]{40,420})[”\"]", txt)
-        # heuristic: prefer true quotes; else fallback to a strong sentence
-        if not spans:
-            sents = re.split(r"(?<=[\.\!\?])\s+", txt.strip())
-            sents = [s for s in sents if 60 <= len(s) <= 260]
-            if sents: spans = [sents[0]]
-        if spans and src not in used:
-            q = "“" + spans[0].strip() + "”"
-            # Try to infer person from source filename (e.g., 'Anneke Brown — COMO The Treasury.docx')
-            person = re.sub(r"\.\w+$","", src).strip()
-            # Keep simple/clean names (at least two words)
-            if len(person.split()) < 2:
-                # attempt to infer from text (leading capitalized bigrams)
-                m = re.search(r"\b([A-Z][a-z]+ [A-Z][A-Za-z\-\']+)", txt[:140])
-                person = m.group(1) if m else "Source Book"
-            quotes.append((q, f"— {person}"))
-            used.add(src)
-    return quotes
-
-def _limit_overuse_and_topup_diversity(ch_head: str, ch_md: str, max_per_person: int, min_unique_people: int, max_inserts: int) -> str:
-    """
-    Cap repeated attributions to the same person and add new diverse quotes if chapter lacks variety.
-    """
-    lines = ch_md.split("\n")
-    blocks = _quote_blocks(ch_md)
-    counts: Dict[str,int] = {}
-    # Count current people
-    for _,_,_, attrib in blocks:
-        who = _extract_person_from_attrib_line(attrib) or "Unknown"
-        counts[who] = counts.get(who, 0) + 1
-    # Remove excess quotes for overused people (keep earliest)
-    to_remove_ranges = []
-    seen_per_person: Dict[str,int] = {}
-    for start, end, q, attrib in blocks:
-        who = _extract_person_from_attrib_line(attrib) or "Unknown"
-        seen_per_person[who] = seen_per_person.get(who, 0) + 1
-        if max_per_person > 0 and seen_per_person[who] > max_per_person:
-            to_remove_ranges.append((start, end))
-    # Apply removals (back to front)
-    for s,e in sorted(to_remove_ranges, key=lambda x: -x[0]):
-        del lines[s:e]
-    ch_md = "\n".join(lines)
-    # Recalculate after removals
-    blocks = _quote_blocks(ch_md)
-    people_now = set()
-    for _,_,_, attrib in blocks:
-        who = _extract_person_from_attrib_line(attrib) or "Unknown"
-        people_now.add(who)
-    # Top-up with diverse quotes if needed
-    need = max(0, min_unique_people - len([p for p in people_now if p != "Unknown"]))
-    if need > 0 and max_inserts > 0:
-        candidates = _build_people_index_from_records(k=120)
-        # filter out already present people
-        candidates = [(q,a) for (q,a) in candidates if (_extract_person_from_attrib_line(a) or "") not in people_now]
-        inserts = candidates[:min(need, max_inserts)]
-        if inserts:
-            ins_lines = ch_md.split("\n")
-            # insert after first H2 section start
-            insert_at = 0
-            for i,l in enumerate(ins_lines):
-                if l.strip().startswith("## ") and l.strip().lower() not in ("## conclusion","## final conclusion"):
-                    insert_at = i+1; break
-            block = []
-            for q, a in inserts:
-                block += ["> " + q, "> " + a, ""]
-            ins_lines = ins_lines[:insert_at] + [""] + block + ins_lines[insert_at:]
-            ch_md = "\n".join(ins_lines)
-    return ch_md
-
-def _insert_quotes_into_chapter(ch_head: str, ch_md: str, min_q: int, max_q: int) -> str:
-    if max_q <= 0 or min_q <= 0: return ch_md
-    title = re.sub(r"^#*\s*Chapter\s+\d+:\s*","", ch_head).strip()
-    want = max(min_q, 1)
-    # pull quotes favoring this chapter's theme via retrieval
-    if records:
-        hits = retrieve(f'{title} leadership creativity service guest experience examples quotes', k=18, tags=["Books"])
-    else:
-        hits = []
+    hits = retrieve(f'{ch_title} leadership creativity service guest experience examples quotes', k=k, tags=["Books"])
     quotes = []; used_sources = set()
     for h in hits:
         txt = h["text"]; src = h.get("source","")
         spans = re.findall(r"[“\"]([^”\"]{40,420})[”\"]", txt)
-        person = re.sub(r"\.\w+$","", src).strip() if src else ""
+        person = _extract_person_from_source_name(src) or ""
         if not spans:
             sents = re.split(r"(?<=[\.\!\?])\s+", txt.strip())
             sents = [s for s in sents if 60 <= len(s) <= 260]
@@ -1001,9 +926,14 @@ def _insert_quotes_into_chapter(ch_head: str, ch_md: str, min_q: int, max_q: int
             quotes.append((f"“{q}”", line))
             used_sources.add(src)
         if len(quotes) >= want: break
-    # fallback: nothing found
-    if not quotes:
-        return ch_md
+    return quotes
+
+def _insert_quotes_into_chapter(ch_head: str, ch_md: str, min_q: int, max_q: int) -> str:
+    if max_q <= 0 or min_q <= 0: return ch_md
+    title = re.sub(r"^#*\s*Chapter\s+\d+:\s*","", ch_head).strip()
+    want = max(min_q, 1)
+    quotes = _pick_quotes_for_chapter(title, k=18, want=min(max_q, want))
+    if not quotes: return ch_md
     lines = ch_md.split("\n")
     insert_at = 0
     for i, l in enumerate(lines):
@@ -1035,61 +965,46 @@ def _rebuild_docx_and_save(title: str, thesis_local: str, author: str, md_text: 
         docx_link = None
     return md_link, docx_link, None
 
-# ---- Flow polish + length enforcement ----
-def _polish_flow(ch_head: str, ch_md: str, target_words: int, max_headings: int, model: str) -> str:
-    prompt = f"""
-You are a senior line editor. Rewrite the following chapter text to:
-- streamline flow and transitions, remove clunky phrasing and redundancies,
-- keep a SINGLE "## Conclusion" at the end,
-- limit H2 sections (##) to ≤ {max_headings} total (excluding Conclusion),
-- preserve existing hyperlinks and all verbatim quote attributions of the form: “...” — Full Name, Role (Country),
-- maintain the author’s voice and factual content,
-- aim for ~{target_words} words.
 
-Return ONLY the revised Markdown content for this chapter body (do not add or remove chapter headings outside its body).
-Text:
-{ch_md}
-""".strip()
-    msgs = [
-        {"role":"system","content":"You are a precise nonfiction editor. Reply in Markdown only."},
-        {"role":"user","content":prompt}
-    ]
-    return chat_with_retry(msgs, model=model, temperature=0.3, max_tokens=2800)
+def _remove_excess_quotes(ch_md: str, max_per_person: int) -> str:
+    lines = ch_md.split("\n")
+    blocks = _quote_blocks(ch_md)
+    seen = {}
+    to_remove = []
+    for start, end, _, attrib in blocks:
+        who = _extract_person_from_attrib_line(attrib) or "Unknown"
+        seen[who] = seen.get(who, 0) + 1
+        if seen[who] > max_per_person:
+            to_remove.append((start, end))
+    # remove from bottom to top
+    for s, e in sorted(to_remove, key=lambda x: -x[0]):
+        del lines[s:e]
+    return "\n".join(lines)
 
-def _enforce_length(ch_md: str, target_words: int, tolerance_pct: int, model: str) -> str:
-    tgt = int(target_words)
-    tol = max(0, min(80, int(tolerance_pct)))
-    lo = int(tgt * (1 - tol/100))
-    hi = int(tgt * (1 + tol/100))
-    count = wc(ch_md)
-    if lo <= count <= hi:
+def _topup_unique_people(ch_head: str, ch_md: str, target_unique: int, max_inserts: int = 3) -> str:
+    # collect existing people
+    existing = set()
+    for _, _, _, attrib in _quote_blocks(ch_md):
+        who = _extract_person_from_attrib_line(attrib) or ""
+        if who: existing.add(who)
+    title = re.sub(r"^#*\\s*Chapter\\s+\\d+:\\s*","", ch_head).strip()
+    candidates = _pick_quotes_for_chapter(title, k=30, want=target_unique + max_inserts)
+    # filter out existing
+    filtered = [(q,a) for (q,a) in candidates if (_extract_person_from_attrib_line(a) or "") not in existing]
+    need = max(0, target_unique - len([p for p in existing if p]))
+    if need == 0 or not filtered:
         return ch_md
-    if count > hi:
-        prompt = f"""
-Condense the following chapter to ~{tgt} words (±{tol}%). Remove repetition and tighten language.
-Keep the same headings, hyperlinks, and all quote attributions (“…” — Name).
-Return only the revised Markdown body.
-
-{ch_md}
-""".strip()
-        msgs = [
-            {"role":"system","content":"You are a skilled compressor of nonfiction prose. Reply in Markdown only."},
-            {"role":"user","content":prompt}
-        ]
-        return chat_with_retry(msgs, model=model, temperature=0.3, max_tokens=2600)
-    else:
-        prompt = f"""
-Expand the following chapter to ~{tgt} words (±{tol}%) by deepening analysis and examples (paraphrase from existing material if needed).
-Do NOT invent new quotes or links. Preserve all existing headings, hyperlinks, and quote attributions.
-Return only the revised Markdown body.
-
-{ch_md}
-""".strip()
-        msgs = [
-            {"role":"system","content":"You expand thoughtfully without fluff. Reply in Markdown only."},
-            {"role":"user","content":prompt}
-        ]
-        return chat_with_retry(msgs, model=model, temperature=0.4, max_tokens=2800)
+    inserts = filtered[:min(need, max_inserts)]
+    ins_lines = ch_md.split("\\n")
+    insert_at = 0
+    for i,l in enumerate(ins_lines):
+        if l.strip().startswith("## ") and l.strip().lower() not in ("## conclusion","## final conclusion"):
+            insert_at = i+1; break
+    block = []
+    for q, a in inserts:
+        block += ["> " + q, "> " + a, ""]
+    new_lines = ins_lines[:insert_at] + [""] + block + ins_lines[insert_at:]
+    return "\\n".join(new_lines)
 
 # ========== UI TABS ==========
 tab_gen, tab_post = st.tabs(["🛠 Generate", "🧹 Post‑process"])
@@ -1207,53 +1122,42 @@ with tab_gen:
         )
 
 with tab_post:
-    st.subheader("4) Post‑process manuscript (cleanup + quotes + diversity + flow + length)")
-    st.markdown("Upload the completed draft (**.docx**, **.md**, or **.txt**). Choose clean‑ups; we’ll diversify quotes, streamline flow, enforce chapter length targets, and output a revised Word/Markdown + diff. Quotes are pulled from your ingested books when available.")
+    st.subheader("4) Post‑process manuscript (cleanup + quotes + diff)")
+    st.markdown("Upload the completed draft (Markdown or Word). Choose your clean‑ups and download the revised version + diff. Quotes are pulled from your ingested books.")
 
-    pp_file = st.file_uploader("Upload manuscript (.docx / .md / .txt)", type=["docx","md","txt"], accept_multiple_files=False, key="pp_upl")
-
-    st.markdown("**Cleanup options**")
+    pp_file = st.file_uploader("Upload manuscript (.md or .docx)", type=["md", "docx"], accept_multiple_files=False, key="pp_upl")
     col_pp1, col_pp2, col_pp3 = st.columns(3)
     with col_pp1:
         fix_conclusion = st.checkbox("Ensure single Conclusion per chapter", value=True)
-        condense_heads = st.checkbox("Condense H2 subheadings (≤ N)", value=True)
-        max_h2 = st.number_input("Max H2 per chapter (excl. Conclusion)", 2, 12, 4, 1)
+        condense_heads = st.checkbox("Condense subheadings (≤ 4 / chapter)", value=True)
     with col_pp2:
         dedup_redund = st.checkbox("Remove redundant paragraphs", value=True)
         normalize_heads = st.checkbox("Normalize heading levels", value=True)
-        quote_enable = st.checkbox("Insert missing quotes from books", value=True)
     with col_pp3:
-        cap_overuse = st.checkbox("Cap overuse of the same person", value=True)
-        max_per_person = st.number_input("Max quotes per person / chapter", 1, 6, 2, 1)
-        min_unique_people = st.number_input("Min unique people / chapter", 0, 10, 2, 1)
+        quote_enable = st.checkbox("Distribute verbatim quotes from books", value=True)
+        min_quotes = st.number_input("Min quotes / chapter", 0, 6, 2, 1)
+        max_quotes = st.number_input("Max quotes / chapter", 0, 10, 3, 1)
+warn_person_cap = st.number_input("Warn if any one person has ≥ N quotes", 1, 10, 3, 1)
+warn_min_unique = st.number_input("Warn if unique people < M", 0, 10, 2, 1)
+warn_h2_cap = st.number_input("Warn if H2s exceed N (excl. Conclusion)", 1, 12, 4, 1)
+auto_fix_h2 = st.checkbox("Auto-fix: condense H2s to cap when warned", value=True)
+auto_fix_overuse = st.checkbox("Auto-fix: cap quotes per person at N when warned", value=True)
+auto_fix_variety = st.checkbox("Auto-fix: top up quotes to reach M unique people", value=True)
 
-    st.markdown("**Polish & length**")
-    col_len1, col_len2 = st.columns(2)
-    with col_len1:
-        enforce_length = st.checkbox("Enforce chapter length target", value=True)
-        target_words = st.number_input("Target words / chapter", 800, 12000, 3500, 50)
-        tolerance_pct = st.slider("Tolerance ±%", 0, 50, 10, 1)
-    with col_len2:
-        polish_flow = st.checkbox("Polish flow & transitions (LLM)", value=True)
-        max_inserts = st.number_input("Max diversity inserts per chapter", 0, 10, 2, 1)
 
-    st.caption("Tip: Keep diversity caps on to avoid over-relying on a single interviewee. Length enforcement respects your target within the chosen tolerance.")
-    pp_go = st.button("🧹 Clean, Balance & Polish", type="primary", disabled=st.session_state.busy)
+    st.caption("Tip: leave quotes enabled for richer, example-driven chapters. Web links already in your draft are preserved.")
+    pp_go = st.button("🧹 Clean & Enrich Manuscript", type="primary", disabled=st.session_state.busy)
 
+    
     if pp_go:
         if not pp_file:
             st.warning("Please upload a manuscript file.")
         else:
             try:
-                # Load manuscript into Markdown
-                name = pp_file.name.lower()
-                if name.endswith(".docx"):
+                if pp_file.name.lower().endswith(".docx"):
                     md_raw = _docx_to_md_simple(pp_file.read())
-                elif name.endswith(".md"):
+                else:
                     md_raw = pp_file.read().decode("utf-8", errors="ignore")
-                else:  # .txt
-                    md_raw = pp_file.read().decode("utf-8", errors="ignore")
-
                 md_orig = md_raw
 
                 header, chapters = "", []
@@ -1264,41 +1168,111 @@ with tab_post:
                     chapters = [("# Chapter 1: Untitled", md_orig)]
                     header = ""
 
+                # --- Progress + stats UI ---
+                total = len(chapters)
+                overall = st.progress(0.0, text="Preparing…")
+                stats_placeholder = st.empty()
+                log_area = st.container()
+
+                def chapter_stats(md_body: str):
+                    wc_ = wc(md_body)
+                    h2s = len([l for l in md_body.split("\n") if l.strip().startswith("## ") and l.strip().lower() not in ("## conclusion","## final conclusion")])
+                    people = set()
+                    for _, _, _, attrib in _quote_blocks(md_body):
+                        who = _extract_person_from_attrib_line(attrib) or ""
+                        if who: people.add(who)
+                    return wc_, h2s, len(people)
+
                 revised = []
                 import difflib as _dif
 
-                for head, body in chapters:
-                    ch = body
-                    if normalize_heads:
-                        ch = _normalize_heading_levels(ch)
-                    if fix_conclusion:
-                        ch = _ensure_single_conclusion(ch)
-                    if condense_heads:
-                        ch = _condense_subheads(ch, max_headings=int(max_h2))
-                    if dedup_redund:
-                        ch = _dedup_paragraphs(ch)
-                    if cap_overuse:
-                        ch = _limit_overuse_and_topup_diversity(head, ch,
-                                                                max_per_person=int(max_per_person),
-                                                                min_unique_people=int(min_unique_people),
-                                                                max_inserts=int(max_inserts))
-                    if quote_enable:
-                        # add quotes if chapter has none
-                        if not _quote_blocks(ch):
-                            ch = _insert_quotes_into_chapter(head, ch, min_q=1, max_q=2)
+                for idx, (head, body) in enumerate(chapters, start=1):
+                    st.session_state.last_tick = time.time()  # heartbeat
+                    with log_area.expander(f"Chapter {idx}: processing…", expanded=False):
+                        st.write(head)
+                        with st.spinner("Cleaning…"):
+                            ch = body
+                            if normalize_heads:
+                                ch = _normalize_heading_levels(ch)
+                            if fix_conclusion:
+                                ch = _ensure_single_conclusion(ch)
+                            if condense_heads:
+                                ch = _condense_subheads(ch, max_headings=4)
+                            if dedup_redund:
+                                ch = _dedup_paragraphs(ch)
+                            if quote_enable and max_quotes > 0:
+                                ch = _insert_quotes_into_chapter(head, ch, min_q=int(min_quotes), max_q=int(max_quotes))
 
-                    if polish_flow:
-                        ch = _polish_flow(head, ch, target_words=int(target_words), max_headings=int(max_h2), model=st.session_state.model)
+                            # Interim stats
+                            wc_now, h2_now, ppl_now = chapter_stats(ch)
 
-                    if enforce_length:
-                        ch = _enforce_length(ch, target_words=int(target_words), tolerance_pct=int(tolerance_pct), model=st.session_state.model)
+                            # Count per-person quotes
+                            person_counts = {}
+                            for _, _, _, attrib in _quote_blocks(ch):
+                                who = _extract_person_from_attrib_line(attrib) or ""
+                                if who:
+                                    person_counts[who] = person_counts.get(who, 0) + 1
 
-                    # Always ensure exactly one Conclusion at end post‑edits
-                    ch = _ensure_single_conclusion(ch)
-                    # Clip subheads again if polish/length added extra
-                    ch = _condense_subheads(ch, max_headings=int(max_h2))
+                            st.write(f"Interim stats → words: {wc_now:,} | H2s: {h2_now} | unique people quoted: {ppl_now}")
 
-                    revised.append((head, ch))
+                            # Warnings
+                            had_warning = False
+                            if h2_now > int(warn_h2_cap):
+                                st.warning(f"H2 headings exceed cap: {h2_now} > {int(warn_h2_cap)}")
+                                had_warning = True
+                            overused = [(who, c) for who, c in person_counts.items() if c >= int(warn_person_cap)]
+                            if overused:
+                                who_list = ", ".join([f"{w} ({c})" for w, c in sorted(overused, key=lambda x: -x[1])])
+                                st.warning(f"Quote concentration flagged — at/above cap {int(warn_person_cap)}: {who_list}")
+                                had_warning = True
+                            if ppl_now < int(warn_min_unique):
+                                st.warning(f"Low variety — unique people: {ppl_now} < {int(warn_min_unique)}")
+                                had_warning = True
+                            if not had_warning:
+                                st.info("No issues detected for this chapter.")
+                            else:
+                                # Auto-fixes
+                                changed = False
+                                if h2_now > int(warn_h2_cap) and auto_fix_h2:
+                                    ch = _condense_subheads(ch, max_headings=int(warn_h2_cap))
+                                    changed = True
+                                if overused and auto_fix_overuse:
+                                    ch = _remove_excess_quotes(ch, max_per_person=int(warn_person_cap))
+                                    changed = True
+                                # recompute after removals if we plan to top up
+                                if auto_fix_variety and ppl_now < int(warn_min_unique):
+                                    ch = _topup_unique_people(head, ch, target_unique=int(warn_min_unique), max_inserts=3)
+                                    changed = True
+                                if changed:
+                                    # recompute stats after fixes
+                                    wc_now, h2_now, ppl_now = chapter_stats(ch)
+                                    st.info(f"Auto-fixes applied → words: {wc_now:,} | H2s: {h2_now} | unique people quoted: {ppl_now}")
+
+                            revised.append((head, ch))
+                            st.success("Done ✅")
+
+                    # Update overall progress + live table
+                    done = len(revised)
+                    overall.progress(done/total, text=f"Processed {done}/{total} chapters")
+
+                    rows = []
+                    for i, (h, b) in enumerate(revised, start=1):
+                        w_, h2_, ppl_ = chapter_stats(b)
+                        # recompute per-person counts for flags
+                        pc = {}
+                        for _, _, _, attrib in _quote_blocks(b):
+                            who = _extract_person_from_attrib_line(attrib) or ""
+                            if who:
+                                pc[who] = pc.get(who, 0) + 1
+                        flags = []
+                        if h2_ > int(warn_h2_cap): flags.append("H2")
+                        if any(c >= int(warn_person_cap) for c in pc.values()): flags.append("Overuse")
+                        if ppl_ < int(warn_min_unique): flags.append("Variety")
+                        flag_str = ", ".join(flags) if flags else ""
+                        title = re.sub(r"^#*\s*Chapter\s+\d+:\s*","", h).strip()
+                        rows.append({"#": i, "Title": title[:60], "Words": w_, "H2s": h2_, "Unique people": ppl_, "Flags": flag_str})
+                    import pandas as _pd
+                    stats_placeholder.dataframe(_pd.DataFrame(rows), use_container_width=True)
 
                 manuscript_pp = (header.strip() + "\n\n" if header.strip() else "") + "\n\n".join(
                     [f"{h}\n\n{b}".strip() for (h,b) in revised]
@@ -1311,6 +1285,18 @@ with tab_post:
                     docx_bytes_pp = md_to_docx(manuscript_pp, "Revised Manuscript", "", author=_sec("BOOK_AUTHOR") or "")
                     st.download_button("⬇️ Download cleaned manuscript (Word .docx)", docx_bytes_pp, file_name="manuscript_cleaned.docx")
                 except Exception as e:
+                    st.warning(f"Could not make .docx: {e}")
+                st.download_button("⬇️ Download diff (MD)", diff_text, file_name="manuscript_diff.md")
+
+                md_link, docx_link, _ = _rebuild_docx_and_save("Revised Manuscript", "", _sec("BOOK_AUTHOR") or "", manuscript_pp, out_prefix="POST")
+                if md_link: st.success(f"Saved cleaned Markdown to GitHub: {md_link}")
+                if docx_link: st.success(f"Saved cleaned Word to GitHub: {docx_link}")
+
+                overall.progress(1.0, text="Post-processing complete.")
+                st.success("✅ Post‑processing complete.")
+            except Exception as e:
+                st.error(f"Post‑processing failed: {e}")
+
                     st.warning(f"Could not make .docx: {e}")
                 st.download_button("⬇️ Download diff (MD)", diff_text, file_name="manuscript_diff.md")
 
