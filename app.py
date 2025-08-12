@@ -1297,13 +1297,3 @@ with tab_post:
             except Exception as e:
                 st.error(f"Post‑processing failed: {e}")
 
-                    st.warning(f"Could not make .docx: {e}")
-                st.download_button("⬇️ Download diff (MD)", diff_text, file_name="manuscript_diff.md")
-
-                md_link, docx_link, _ = _rebuild_docx_and_save("Revised Manuscript", "", _sec("BOOK_AUTHOR") or "", manuscript_pp, out_prefix="POST")
-                if md_link: st.success(f"Saved cleaned Markdown to GitHub: {md_link}")
-                if docx_link: st.success(f"Saved cleaned Word to GitHub: {docx_link}")
-
-                st.success("✅ Post‑processing complete.")
-            except Exception as e:
-                st.error(f"Post‑processing failed: {e}")
