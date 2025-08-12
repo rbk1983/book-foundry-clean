@@ -1137,12 +1137,12 @@ with tab_post:
         quote_enable = st.checkbox("Distribute verbatim quotes from books", value=True)
         min_quotes = st.number_input("Min quotes / chapter", 0, 6, 2, 1)
         max_quotes = st.number_input("Max quotes / chapter", 0, 10, 3, 1)
-warn_person_cap = st.number_input("Warn if any one person has ≥ N quotes", 1, 10, 3, 1)
-warn_min_unique = st.number_input("Warn if unique people < M", 0, 10, 2, 1)
-warn_h2_cap = st.number_input("Warn if H2s exceed N (excl. Conclusion)", 1, 12, 4, 1)
-auto_fix_h2 = st.checkbox("Auto-fix: condense H2s to cap when warned", value=True)
-auto_fix_overuse = st.checkbox("Auto-fix: cap quotes per person at N when warned", value=True)
-auto_fix_variety = st.checkbox("Auto-fix: top up quotes to reach M unique people", value=True)
+    warn_person_cap = st.number_input("Warn if any one person has ≥ N quotes", 1, 10, 3, 1)
+    warn_min_unique = st.number_input("Warn if unique people < M", 0, 10, 2, 1)
+    warn_h2_cap = st.number_input("Warn if H2s exceed N (excl. Conclusion)", 1, 12, 4, 1)
+    auto_fix_h2 = st.checkbox("Auto-fix: condense H2s to cap when warned", value=True)
+    auto_fix_overuse = st.checkbox("Auto-fix: cap quotes per person at N when warned", value=True)
+    auto_fix_variety = st.checkbox("Auto-fix: top up quotes to reach M unique people", value=True)
 
 
     st.caption("Tip: leave quotes enabled for richer, example-driven chapters. Web links already in your draft are preserved.")
